@@ -1594,11 +1594,20 @@ func workflowWithWorkflowEnvironment(count int) string {
 	return builder.String()
 }
 
-func TestParseRejectsMissingOrLongWorkflowName(t *testing.T) {
-	for _, name := range []string{"", strings.Repeat("n", maxWorkflowNameLength+1)} {
-		data := []byte("name: " + name + "\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n")
-		if _, err := Parse(data); err == nil {
-			t.Errorf("Parse() accepted workflow name with %d characters", len(name))
-		}
+func TestParseAllowsMissingWorkflowName(t *testing.T) {
+	definition, err := Parse([]byte("on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if definition.Name != "" {
+		t.Fatalf("workflow name = %q, want empty", definition.Name)
+	}
+}
+
+func TestParseRejectsLongWorkflowName(t *testing.T) {
+	name := strings.Repeat("n", maxWorkflowNameLength+1)
+	data := []byte("name: " + name + "\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n")
+	if _, err := Parse(data); err == nil {
+		t.Errorf("Parse() accepted workflow name with %d characters", len(name))
 	}
 }

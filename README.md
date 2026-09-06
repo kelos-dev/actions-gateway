@@ -19,9 +19,8 @@ constraints. Unsupported workflows fail explicitly.
 
 The controller receives GitHub webhooks, creates `WorkflowRun` and `WorkflowJob`
 resources, schedules jobs on matching `Runner` resources, and reports status
-through an aggregate workflow commit status and a commit status for each job on
-push, pull request, and merge-group runs. Each status links directly to the
-corresponding workflow or job in the Console.
+through a commit status for each job on push, pull request, and merge-group
+runs. Each status links directly to the corresponding job in the Console.
 Runners execute steps in Kubernetes Jobs and use the standalone artifact service
 for workflow artifact uploads and downloads. The Console shows runs, jobs, and
 live logs. Each `Project` defines an execution domain and its GitHub App
@@ -214,7 +213,7 @@ cp .github/workflows/ci.yaml .open-actions/workflows/ci.yaml
 ```
 
 Push the copy from a branch in a repository where the App is installed and
-confirm its `Open Actions / .open-actions/workflows/ci.yaml` check passes.
+confirm its `Open Actions / CI` check passes.
 GitHub Actions and Open Actions will run in parallel while both files exist.
 Then update any required checks and delete `.github/workflows/ci.yaml`. Restore
 that file to roll back.

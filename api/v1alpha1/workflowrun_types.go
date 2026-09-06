@@ -535,44 +535,6 @@ type WorkflowRunJobStatus struct {
 	Cancelled int32 `json:"cancelled,omitempty"`
 }
 
-// GitHubCommitStatusState is a state accepted by GitHub's commit-status API.
-type GitHubCommitStatusState string
-
-const (
-	GitHubCommitStatusStateError   GitHubCommitStatusState = "error"
-	GitHubCommitStatusStateFailure GitHubCommitStatusState = "failure"
-	GitHubCommitStatusStatePending GitHubCommitStatusState = "pending"
-	GitHubCommitStatusStateSuccess GitHubCommitStatusState = "success"
-)
-
-// GitHubCommitStatus records a GitHub commit status managed by Open Actions.
-type GitHubCommitStatus struct {
-	// State is the last commit-status state accepted by GitHub.
-	// +kubebuilder:validation:Enum=error;failure;pending;success
-	// +required
-	State GitHubCommitStatusState `json:"state"`
-
-	// ReportDigest is the SHA-256 digest of the commit-status fields last
-	// accepted by GitHub.
-	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
-	// +optional
-	ReportDigest string `json:"reportDigest,omitempty"`
-}
-
-// GitHubWorkflowRunStatus contains GitHub observations for a WorkflowRun.
-type GitHubWorkflowRunStatus struct {
-	// CommitStatus is the GitHub commit status that reports this WorkflowRun.
-	// +optional
-	CommitStatus *GitHubCommitStatus `json:"commitStatus,omitempty"`
-}
-
-// WorkflowRunSourceStatus contains provider-specific observations.
-type WorkflowRunSourceStatus struct {
-	// GitHub contains observations for a GitHub workflow source.
-	// +optional
-	GitHub *GitHubWorkflowRunStatus `json:"github,omitempty"`
-}
-
 // WorkflowRunIdentityStatus contains the GitHub-compatible identity allocated
 // to a workflow run lineage.
 type WorkflowRunIdentityStatus struct {
@@ -615,8 +577,9 @@ type WorkflowRunStatus struct {
 	// +optional
 	Identity *WorkflowRunIdentityStatus `json:"identity,omitempty"`
 
-	// WorkflowName is the display name read from the selected workflow file.
-	// +kubebuilder:validation:MaxLength=256
+	// WorkflowName is the configured workflow name, or its repository-relative
+	// path when the workflow does not define a name.
+	// +kubebuilder:validation:MaxLength=512
 	// +optional
 	WorkflowName string `json:"workflowName,omitempty"`
 
@@ -644,10 +607,6 @@ type WorkflowRunStatus struct {
 	// CompletionTime is when the run reached a terminal result.
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
-
-	// Source contains provider-specific reporting state.
-	// +optional
-	Source *WorkflowRunSourceStatus `json:"source,omitempty"`
 
 	// Conditions describe approval, planning, and the terminal result.
 	// Known condition types are Approved, Planned, and Succeeded.

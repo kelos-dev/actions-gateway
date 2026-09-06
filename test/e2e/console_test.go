@@ -58,45 +58,8 @@ var _ = Describe("Console", func() {
 			if condition != nil {
 				g.Expect(condition.Status).To(Equal(metav1.ConditionTrue), condition.Message)
 			}
-			g.Expect(stored.Status.Source).NotTo(BeNil())
-			if stored.Status.Source == nil {
-				return
-			}
-			g.Expect(stored.Status.Source.GitHub).NotTo(BeNil())
-			if stored.Status.Source.GitHub == nil {
-				return
-			}
-			commitStatus := stored.Status.Source.GitHub.CommitStatus
-			g.Expect(commitStatus).NotTo(BeNil())
-			if commitStatus != nil {
-				g.Expect(commitStatus.State).To(Equal(actionsv1alpha1.GitHubCommitStatusStateSuccess))
-			}
 		}, 180*time.Second, time.Second).Should(Succeed())
 		runPath := "/runs/" + url.PathEscape(run.Namespace) + "/" + url.PathEscape(run.Name)
-		targetURL := consoleURL + runPath
-		Eventually(func(g Gomega) {
-			response, err := http.Get(fixtureURL + "/fixture/commit-status?target_url=" + url.QueryEscape(targetURL))
-			g.Expect(err).NotTo(HaveOccurred())
-			if err != nil {
-				return
-			}
-			defer response.Body.Close()
-			g.Expect(response.StatusCode).To(Equal(http.StatusOK))
-			if response.StatusCode != http.StatusOK {
-				return
-			}
-			report := struct {
-				State       string `json:"state"`
-				TargetURL   string `json:"target_url"`
-				Description string `json:"description"`
-				Context     string `json:"context"`
-			}{}
-			g.Expect(json.NewDecoder(response.Body).Decode(&report)).To(Succeed())
-			g.Expect(report.TargetURL).To(Equal(targetURL))
-			g.Expect(report.State).To(Equal("success"))
-			g.Expect(report.Description).To(Equal("All required WorkflowJobs succeeded"))
-			g.Expect(report.Context).To(Equal("Open Actions / " + workflowPath))
-		}, 30*time.Second, time.Second).Should(Succeed())
 
 		var workflowJob actionsv1alpha1.WorkflowJob
 		Eventually(func(g Gomega) {
@@ -123,6 +86,10 @@ var _ = Describe("Console", func() {
 			}
 			g.Expect(workflowJob.Name).NotTo(BeEmpty())
 		}, 30*time.Second, time.Second).Should(Succeed())
+		response, err := http.Get(fixtureURL + "/fixture/commit-status?target_url=" + url.QueryEscape(consoleURL+runPath))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(response.StatusCode).To(Equal(http.StatusNotFound))
+		Expect(response.Body.Close()).To(Succeed())
 
 		webClient := &http.Client{Timeout: 30 * time.Second}
 		loginBody, err := json.Marshal(map[string]string{"token": consoleToken})
@@ -171,7 +138,7 @@ var _ = Describe("Console", func() {
 			g.Expect(json.NewDecoder(response.Body).Decode(&report)).To(Succeed())
 			g.Expect(report.TargetURL).To(Equal(consoleURL + jobPath))
 			g.Expect(report.State).To(Equal("success"))
-			g.Expect(report.Context).To(Equal("Open Actions / " + workflowPath + " / test"))
+			g.Expect(report.Context).To(Equal("Open Actions / Fixture CI / test"))
 		}, 30*time.Second, time.Second).Should(Succeed())
 		jobPage := getConsolePage(webClient, consoleURL+jobPath, http.StatusOK)
 		Expect(jobPage).To(ContainSubstring("<h1>test</h1>"))
