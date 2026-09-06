@@ -1443,16 +1443,17 @@ func workflowRunQueryURL(baseURL string, run *actionsv1alpha1.WorkflowRun) strin
 }
 
 type plannedWorkflowJob struct {
-	id             string
-	displayName    string
-	runsOn         []string
-	needs          []string
-	condition      string
-	concurrency    *actionsv1alpha1.WorkflowJobConcurrency
-	matrix         *actionsv1alpha1.WorkflowJobMatrix
-	plan           string
-	resultVersion  string
-	timeoutSeconds int64
+	id              string
+	displayName     string
+	runsOn          []string
+	needs           []string
+	condition       string
+	concurrency     *actionsv1alpha1.WorkflowJobConcurrency
+	matrix          *actionsv1alpha1.WorkflowJobMatrix
+	plan            string
+	resultVersion   string
+	timeoutSeconds  int64
+	continueOnError bool
 }
 
 type deferredJobPlan struct {
@@ -1710,15 +1711,16 @@ func (r *WorkflowRunReconciler) ensureWorkflowJobs(ctx context.Context, run *act
 				Annotations: annotations,
 			},
 			Spec: actionsv1alpha1.WorkflowJobSpec{
-				WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name},
-				JobID:          id,
-				DisplayName:    item.displayName,
-				RunsOn:         append([]string(nil), item.runsOn...),
-				Needs:          append([]string(nil), item.needs...),
-				If:             item.condition,
-				Concurrency:    item.concurrency.DeepCopy(),
-				Matrix:         item.matrix.DeepCopy(),
-				TimeoutSeconds: item.timeoutSeconds,
+				WorkflowRunRef:  corev1.LocalObjectReference{Name: run.Name},
+				JobID:           id,
+				DisplayName:     item.displayName,
+				RunsOn:          append([]string(nil), item.runsOn...),
+				Needs:           append([]string(nil), item.needs...),
+				If:              item.condition,
+				Concurrency:     item.concurrency.DeepCopy(),
+				Matrix:          item.matrix.DeepCopy(),
+				TimeoutSeconds:  item.timeoutSeconds,
+				ContinueOnError: item.continueOnError,
 			},
 		}
 		if err := controllerutil.SetControllerReference(run, workflowJob, r.Scheme()); err != nil {
@@ -1796,7 +1798,7 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 		if len(combinations) == 0 {
 			combinations = []map[string]any{nil}
 		}
-		expanded, err := r.expandPlannedWorkflowJob(run, definition.Name, id, workflowEnv, definitionJob, inputValues, expressionContext, combinations, sourceIDs, plannedIDs)
+		expanded, err := r.expandPlannedWorkflowJob(run, definition.Name, id, workflowEnv, definitionJob, inputValues, expressionContext, combinations, sourceIDs, plannedIDs, nil)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1808,7 +1810,7 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 	return plannedJobs, deferredJobs, nil
 }
 
-func (r *WorkflowRunReconciler) expandPlannedWorkflowJob(run *actionsv1alpha1.WorkflowRun, workflowName, id string, workflowEnv map[string]string, definitionJob workflow.Job, inputValues map[string]any, expressionContext workflowexpression.Context, combinations []map[string]any, sourceIDs, plannedIDs map[string]struct{}) ([]plannedWorkflowJob, error) {
+func (r *WorkflowRunReconciler) expandPlannedWorkflowJob(run *actionsv1alpha1.WorkflowRun, workflowName, id string, workflowEnv map[string]string, definitionJob workflow.Job, inputValues map[string]any, expressionContext workflowexpression.Context, combinations []map[string]any, sourceIDs, plannedIDs map[string]struct{}, continueOnErrorByID map[string]bool) ([]plannedWorkflowJob, error) {
 	plannedJobs := make([]plannedWorkflowJob, 0, len(combinations))
 	for index, matrix := range combinations {
 		expandedID := id
@@ -1835,7 +1837,11 @@ func (r *WorkflowRunReconciler) expandPlannedWorkflowJob(run *actionsv1alpha1.Wo
 			jobContext.Values["matrix"] = matrix
 			jobContext.Values["strategy"] = workflowJobStrategyContext(matrixSpec)
 		}
-		resolvedJob, err := workflow.EvaluateJob(id, definitionJob, jobContext)
+		job := definitionJob
+		if value, found := continueOnErrorByID[expandedID]; found {
+			job.ContinueOnError = workflow.BooleanExpression{Value: value}
+		}
+		resolvedJob, err := workflow.EvaluateJob(id, job, jobContext)
 		if err != nil {
 			return nil, err
 		}
@@ -1869,16 +1875,17 @@ func (r *WorkflowRunReconciler) expandPlannedWorkflowJob(run *actionsv1alpha1.Wo
 			}
 		}
 		plannedJobs = append(plannedJobs, plannedWorkflowJob{
-			id:             expandedID,
-			displayName:    displayName,
-			runsOn:         append([]string(nil), resolvedJob.RunsOn...),
-			needs:          append([]string(nil), resolvedJob.Needs...),
-			condition:      resolvedJob.If,
-			concurrency:    concurrency,
-			matrix:         matrixSpec,
-			plan:           string(data),
-			resultVersion:  jobResultVersion,
-			timeoutSeconds: timeoutSeconds,
+			id:              expandedID,
+			displayName:     displayName,
+			runsOn:          append([]string(nil), resolvedJob.RunsOn...),
+			needs:           append([]string(nil), resolvedJob.Needs...),
+			condition:       resolvedJob.If,
+			concurrency:     concurrency,
+			matrix:          matrixSpec,
+			plan:            string(data),
+			resultVersion:   jobResultVersion,
+			timeoutSeconds:  timeoutSeconds,
+			continueOnError: resolvedJob.ContinueOnError.Value,
 		})
 	}
 	return plannedJobs, nil
@@ -2952,10 +2959,13 @@ func (r *WorkflowRunReconciler) reconcileDeferredJobs(ctx context.Context, run *
 			return state, &terminalPlanningError{cause: err}
 		}
 		jobPlanned := false
+		continueOnErrorByID := map[string]bool{}
 		for _, job := range jobsByLogicalID[id] {
 			if !deferredJobResultPlaceholderMatches(job, resultPlaceholder, run) {
 				jobPlanned = true
-				break
+				// Expansion recovers missing children; existing children retain
+				// their immutable tolerance decisions.
+				continueOnErrorByID[job.Spec.JobID] = job.Spec.ContinueOnError
 			}
 		}
 
@@ -3037,7 +3047,7 @@ func (r *WorkflowRunReconciler) reconcileDeferredJobs(ctx context.Context, run *
 		for expectedID := range state.expected {
 			plannedIDs[expectedID] = struct{}{}
 		}
-		expanded, err := r.expandPlannedWorkflowJob(run, plan.WorkflowName, id, plan.WorkflowEnv, plan.Job, plan.InputValues, expressionContext, combinations, sourceIDs, plannedIDs)
+		expanded, err := r.expandPlannedWorkflowJob(run, plan.WorkflowName, id, plan.WorkflowEnv, plan.Job, plan.InputValues, expressionContext, combinations, sourceIDs, plannedIDs, continueOnErrorByID)
 		if err != nil {
 			var unavailable *projectValuesUnavailableError
 			if errors.As(err, &unavailable) {
@@ -3179,6 +3189,7 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 	lostState := ""
 	waitingForRuntimeState := false
 	hasNonFailFastCancellation := false
+	hasFailure := false
 	if len(jobs.Items) != expectedObjects {
 		active, err := activeRuntimeWorkloads(ctx, reader, run)
 		if err != nil {
@@ -3255,6 +3266,9 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 			startTime = job.Status.StartTime.DeepCopy()
 		}
 		result := workflowJobResult(job)
+		if workflowJobEffectiveResult(job) == actionsv1alpha1.WorkflowJobResultFailure {
+			hasFailure = true
+		}
 		if result != "" && job.Status.Concurrency != nil {
 			active, err := r.workflowJobExecutionActive(ctx, job)
 			if err != nil {
@@ -3369,7 +3383,7 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 		now := metav1.Now()
 		run.Status.CompletionTime = &now
 		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: run.Generation, Reason: "JobTimedOut", Message: "At least one WorkflowJob timed out"})
-	case terminal && status.Failed > 0:
+	case terminal && hasFailure:
 		now := metav1.Now()
 		run.Status.CompletionTime = &now
 		meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowRunConditionSucceeded, Status: metav1.ConditionFalse, ObservedGeneration: run.Generation, Reason: "JobFailed", Message: "At least one WorkflowJob failed"})
@@ -3720,7 +3734,7 @@ func workflowNeedsContext(job *actionsv1alpha1.WorkflowJob, jobs map[string][]*a
 func workflowJobGroupResult(jobs []*actionsv1alpha1.WorkflowJob) actionsv1alpha1.WorkflowJobResult {
 	result := actionsv1alpha1.WorkflowJobResultSuccess
 	for _, job := range jobs {
-		switch workflowJobResult(job) {
+		switch workflowJobEffectiveResult(job) {
 		case actionsv1alpha1.WorkflowJobResultFailure:
 			return actionsv1alpha1.WorkflowJobResultFailure
 		case actionsv1alpha1.WorkflowJobResultCancelled:
@@ -3751,7 +3765,7 @@ func workflowJobAncestorStatus(job *actionsv1alpha1.WorkflowJob, jobs map[string
 			return
 		}
 		for _, dependency := range dependencies {
-			switch workflowJobResult(dependency) {
+			switch workflowJobEffectiveResult(dependency) {
 			case actionsv1alpha1.WorkflowJobResultFailure:
 				status.Success = false
 				status.Failure = true
@@ -3932,6 +3946,16 @@ func workflowJobResult(job *actionsv1alpha1.WorkflowJob) actionsv1alpha1.Workflo
 
 func workflowJobTerminal(job *actionsv1alpha1.WorkflowJob) bool {
 	return workflowJobResult(job) != ""
+}
+
+// workflowJobEffectiveResult applies job tolerance only to orchestration;
+// execution status and individual GitHub reports retain the raw result.
+func workflowJobEffectiveResult(job *actionsv1alpha1.WorkflowJob) actionsv1alpha1.WorkflowJobResult {
+	result := workflowJobResult(job)
+	if result == actionsv1alpha1.WorkflowJobResultFailure && job.Spec.ContinueOnError && !workflowJobTimedOut(job) {
+		return actionsv1alpha1.WorkflowJobResultSuccess
+	}
+	return result
 }
 
 func workflowJobCancelledByMatrixFailFast(job *actionsv1alpha1.WorkflowJob) bool {

@@ -212,19 +212,20 @@ func (schedule *Schedule) UnmarshalYAML(node *yaml.Node) error {
 }
 
 type Job struct {
-	Name           string         `yaml:"name"`
-	RunsOn         StringList     `yaml:"runs-on"`
-	Needs          StringList     `yaml:"needs"`
-	Permissions    Permissions    `yaml:"permissions"`
-	Outputs        map[string]any `yaml:"outputs"`
-	Steps          []Step         `yaml:"steps"`
-	Strategy       Strategy       `yaml:"strategy"`
-	Concurrency    Concurrency    `yaml:"concurrency"`
-	Container      yaml.Node      `yaml:"container"`
-	Services       yaml.Node      `yaml:"services"`
-	If             string         `yaml:"if"`
-	Env            map[string]any `yaml:"env"`
-	TimeoutMinutes JobTimeout     `yaml:"timeout-minutes"`
+	Name            string            `yaml:"name"`
+	RunsOn          StringList        `yaml:"runs-on"`
+	Needs           StringList        `yaml:"needs"`
+	Permissions     Permissions       `yaml:"permissions"`
+	Outputs         map[string]any    `yaml:"outputs"`
+	Steps           []Step            `yaml:"steps"`
+	Strategy        Strategy          `yaml:"strategy"`
+	Concurrency     Concurrency       `yaml:"concurrency"`
+	Container       yaml.Node         `yaml:"container"`
+	Services        yaml.Node         `yaml:"services"`
+	If              string            `yaml:"if"`
+	Env             map[string]any    `yaml:"env"`
+	TimeoutMinutes  JobTimeout        `yaml:"timeout-minutes"`
+	ContinueOnError BooleanExpression `yaml:"continue-on-error"`
 }
 
 // JobTimeout is a positive whole-minute timeout or an expression that resolves
@@ -481,6 +482,9 @@ func validateJob(id string, job *Job, workflowEnv map[string]any) error {
 	if err := job.TimeoutMinutes.validate(id); err != nil {
 		return err
 	}
+	if err := validateBooleanExpression(fmt.Sprintf("job %q continue-on-error", id), job.ContinueOnError, jobNameAvailability); err != nil {
+		return err
+	}
 	if JobPlanningUsesNeeds(*job) && len(job.Needs) == 0 {
 		return fmt.Errorf("job %q planning expressions use needs but the job declares no dependencies", id)
 	}
@@ -519,7 +523,7 @@ func validateJob(id string, job *Job, workflowEnv map[string]any) error {
 	if len(job.Steps) > maxSteps {
 		return fmt.Errorf("job %q defines %d steps; maximum is %d", id, len(job.Steps), maxSteps)
 	}
-	contentBytes := len(job.Name) + len(job.If) + len(job.Concurrency.Group) + len(job.Concurrency.CancelInProgress.Expression) + len(job.TimeoutMinutes.expression)
+	contentBytes := len(job.Name) + len(job.If) + len(job.Concurrency.Group) + len(job.Concurrency.CancelInProgress.Expression) + len(job.TimeoutMinutes.expression) + len(job.ContinueOnError.Expression)
 	for _, dependency := range job.Needs {
 		contentBytes += len(dependency)
 	}
@@ -834,7 +838,7 @@ func JobPlanningUsesNeeds(job Job) bool {
 	if MatrixUsesNeeds(job.Strategy) {
 		return true
 	}
-	inputs := append([]string{job.Name, job.TimeoutMinutes.expression}, job.RunsOn...)
+	inputs := append([]string{job.Name, job.TimeoutMinutes.expression, job.ContinueOnError.Expression}, job.RunsOn...)
 	for _, input := range inputs {
 		program, err := expression.Parse(input)
 		if err == nil && program.UsesContext("needs") {
@@ -1388,6 +1392,11 @@ func EvaluateJob(id string, job Job, context expression.Context) (Job, error) {
 	if err != nil {
 		return Job{}, err
 	}
+	continueOnError, err := evaluateBooleanExpression(job.ContinueOnError, context)
+	if err != nil {
+		return Job{}, fmt.Errorf("job %q continue-on-error: %w", id, err)
+	}
+	job.ContinueOnError = BooleanExpression{Value: continueOnError}
 
 	job.RunsOn = append(StringList(nil), job.RunsOn...)
 	labels := make(map[string]struct{}, len(job.RunsOn))
@@ -1548,6 +1557,19 @@ func evaluateBooleanExpression(input BooleanExpression, context expression.Conte
 
 func (b BooleanExpression) usesExpression() bool {
 	return b.expressionSet || b.Expression != ""
+}
+
+func (b *BooleanExpression) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Tag {
+	case "!!bool":
+		return node.Decode(&b.Value)
+	case "!!str":
+		b.Expression = node.Value
+		b.expressionSet = true
+		return nil
+	default:
+		return fmt.Errorf("line %d, column %d: value must be a boolean or expression", node.Line, node.Column)
+	}
 }
 
 func expressionValueType(value any) string {

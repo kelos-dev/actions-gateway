@@ -1602,6 +1602,43 @@ func TestWorkflowJobResultIsSetOnce(t *testing.T) {
 	}
 }
 
+func TestWorkflowJobContinueOnErrorContract(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowjobs.yaml")
+	spec := storageVersion(t, crd).Schema.OpenAPIV3Schema.Properties["spec"]
+	property := spec.Properties["continueOnError"]
+	if property.Type != "boolean" || property.Default == nil || string(property.Default.Raw) != "false" || slices.Contains(spec.Required, "continueOnError") {
+		t.Fatalf("continueOnError schema = %#v", property)
+	}
+	for _, value := range []any{nil, false, true, "true"} {
+		t.Run(fmt.Sprint(value), func(t *testing.T) {
+			object := loadWorkflowJobSample(t)
+			delete(object["spec"].(map[string]any), "continueOnError")
+			if value != nil {
+				object["spec"].(map[string]any)["continueOnError"] = value
+			}
+			errs := validateObject(t, crd, object, nil)
+			if _, invalid := value.(string); invalid {
+				if len(errs) == 0 {
+					t.Fatal("non-Boolean continueOnError was accepted")
+				}
+				return
+			}
+			if len(errs) > 0 {
+				t.Fatalf("continueOnError rejected: %v", errs.ToAggregate())
+			}
+			updated := runtime.DeepCopyJSON(object)
+			updated["status"] = map[string]any{"result": "failure"}
+			if errs := validateObject(t, crd, updated, object); len(errs) > 0 {
+				t.Fatalf("status update rejected: %v", errs.ToAggregate())
+			}
+			updated["spec"].(map[string]any)["continueOnError"] = value != true
+			if errs := validateObject(t, crd, updated, object); len(errs) == 0 {
+				t.Fatal("continueOnError update passed immutability validation")
+			}
+		})
+	}
+}
+
 func loadWorkflowJobSample(t *testing.T) map[string]any {
 	t.Helper()
 	object := loadSample(t, "actions_v1alpha1_workflowjob.yaml")

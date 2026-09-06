@@ -376,6 +376,12 @@ completion. After execution, `status.outputs` contains the non-secret outputs
 declared by that workflow job. The controller copies these values from the
 completed runner Pod before removing job credentials and releasing the Runner,
 so they do not depend on Pod log retention.
+`spec.continueOnError` records the resolved job-level `continue-on-error`
+Boolean and defaults to `false`. A tolerated failure keeps `status.result` set
+to `failure`, its outputs, and its individual GitHub commit status. It is
+counted in `WorkflowRun.status.jobs.failed`, but satisfies dependencies and
+does not fail the workflow or trigger matrix fail-fast. The persisted decision
+is reused across controller restarts.
 `WorkflowRun.status.jobs.timedOut` counts jobs whose `Succeeded` condition has
 reason `JobTimedOut`; those jobs retain `failure` as their `status.result` for
 dependency evaluation.
@@ -807,14 +813,15 @@ incompatible entries add standalone combinations. Include-only matrices are
 supported.
 
 Matrix expressions may use `github`, `open_actions`, `needs`, `vars`, and
-`inputs`. Job names, runner labels, and timeout expressions may also use
-`needs`. When one of these planning expressions reads `needs`, planning waits
-until every direct dependency is terminal and its outputs are persisted. The
-controller then evaluates the job condition before the deferred fields. A
-failed, skipped, or cancelled dependency therefore skips the job under the
-default success condition; an explicit status function such as `always()` can
-permit evaluation. Missing outputs, invalid JSON, non-array axes, non-mapping
-complete matrices, non-scalar final values, empty axes, and oversized results
+`inputs`. Job names, runner labels, timeout, and `continue-on-error` expressions
+may also use `needs`. When one of these planning expressions reads `needs`,
+planning waits until every direct dependency is terminal and its outputs are
+persisted. The controller then evaluates the job condition before the deferred fields. A
+failed dependency without job tolerance, a skipped dependency, or a cancelled
+dependency therefore skips the job under the default success condition; an
+explicit status function such as `always()` can permit evaluation. Missing
+outputs, invalid JSON, non-array axes, non-mapping complete matrices, non-scalar
+final values, empty axes, and oversized results
 finish the logical job with `JobPlanningFailed` rather than leaving it pending.
 
 The controller creates one `WorkflowJob` per final combination in deterministic
@@ -825,14 +832,49 @@ owned by the WorkflowRun, so the same configuration and children are recovered
 across controller restarts. `max-parallel` limits active children in that group
 independently of the number of matching Runners.
 
-`fail-fast` defaults to `true`. After a matrix child fails, queued combinations
-in the same WorkflowRun and logical matrix job finish with `MatrixFailFast`, and
-active combinations receive a cancellation request. Cancellation stops the
-active command while still allowing eligible `cancelled()` and `always()` steps
+`fail-fast` defaults to `true`. After a matrix child fails without job tolerance,
+queued combinations in the same WorkflowRun and logical matrix job finish with
+`MatrixFailFast`, and active combinations receive a cancellation request.
+Cancellation stops the active command while still allowing eligible `cancelled()` and `always()` steps
 and action post hooks to run. A fail-fast cancellation is terminal and does not
 start another queued combination, including when `max-parallel` is set.
 Independent jobs and other logical matrix jobs continue normally. Set
 `fail-fast: false` to let every combination reach its normal terminal result.
+
+### Job failure tolerance
+
+`jobs.<id>.continue-on-error` accepts a Boolean literal or one whole expression
+that returns a Boolean, and defaults to `false`. It is resolved independently
+for each matrix child after its `needs`, `matrix`, and `strategy` contexts are
+available. Non-Boolean results and expression errors fail job planning.
+
+For example, [GitHub's experimental matrix pattern](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations#handling-failures)
+allows only the version 9 job to fail:
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: true
+      matrix:
+        version: [6, 7, 8]
+        experimental: [false]
+        include:
+          - version: 9
+            experimental: true
+    steps:
+      - run: ./test-version ${{ matrix.version }}
+```
+
+A tolerated failure satisfies the default downstream success condition and
+exposes `needs.<id>.result == 'success'` with its outputs. A logical matrix
+job still fails if any child has an untolerated failure. When all jobs succeed,
+are skipped, or have tolerated failures, the WorkflowRun succeeds. Each failed
+job retains its failed execution result, completion details, and GitHub commit
+status. These rules also apply to jobs without a matrix. Explicit cancellation
+and execution timeout retain their terminal behavior regardless of tolerance.
 
 ### Job timeouts
 
@@ -1083,7 +1125,7 @@ is rejected when the workflow or action metadata is loaded.
 | Workflow environment | `github`, `open_actions`, `secrets`, `inputs`, `vars` |
 | Job condition | `github`, `open_actions`, `needs`, `vars`, `inputs`; status functions |
 | Job matrix | `github`, `open_actions`, `needs`, `vars`, `inputs` |
-| Job name, runner labels, timeout, and concurrency | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `inputs` |
+| Job name, runner labels, timeout, `continue-on-error`, and concurrency | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `inputs` |
 | Job environment | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `vars`, `secrets`, `inputs` |
 | Job outputs | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs` |
 | Workflow step name, run script, working directory, environment, inputs, and `continue-on-error` | `github`, `open_actions`, `needs`, `strategy`, `matrix`, `job`, `runner`, `env`, `vars`, `secrets`, `steps`, `inputs`; `hashFiles` |
@@ -1589,6 +1631,7 @@ Workflow definitions must satisfy these limits:
 - A run script may contain at most 65,536 bytes.
 - A step condition may contain at most 65,536 bytes.
 - A step `continue-on-error` expression may contain at most 65,536 bytes.
+- A job `continue-on-error` expression may contain at most 65,536 bytes.
 - Each workflow, job, or step `env` map and each `with` map may contain at most
   100 entries.
 

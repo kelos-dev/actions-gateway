@@ -1070,57 +1070,67 @@ func TestMatrixMaxParallelLimitsRunnerClaims(t *testing.T) {
 }
 
 func TestMatrixFailFastFailurePreventsNewClaims(t *testing.T) {
-	scheme := runnerTestScheme(t)
-	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("project-uid")}}
-	run := &actionsv1alpha1.WorkflowRun{
-		ObjectMeta: metav1.ObjectMeta{Name: "release", Namespace: "default", UID: types.UID("run-uid")},
-		Status: actionsv1alpha1.WorkflowRunStatus{Conditions: []metav1.Condition{
-			plannedCondition(metav1.ConditionTrue, "JobsPlanned"),
-		}},
-	}
-	runnerObject := &actionsv1alpha1.Runner{
-		ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: "default", UID: "runner-1"},
-		Spec:       actionsv1alpha1.RunnerSpec{Labels: []string{"ubuntu-latest"}},
-	}
-	job := func(name, logicalID string, failFast *bool) *actionsv1alpha1.WorkflowJob {
-		return &actionsv1alpha1.WorkflowJob{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: name, Namespace: "default",
-				Labels:      map[string]string{actionsv1alpha1.LabelProjectUID: string(project.UID), actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)},
-				Annotations: map[string]string{actionsv1alpha1.AnnotationProjectName: project.Name},
-			},
-			Spec: actionsv1alpha1.WorkflowJobSpec{
-				WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, JobID: name, RunsOn: []string{"ubuntu-latest"},
-				Matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: logicalID, Values: map[string]string{"case": name}, MaxParallel: 1, FailFast: failFast},
-			},
-		}
-	}
-	failed := job("build-failed", "build", nil)
-	meta.SetStatusCondition(&failed.Status.Conditions, metav1.Condition{
-		Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobFailed", Message: "Failed",
-	})
-	blocked := job("build-queued", "build", nil)
-	unrelated := job("test-queued", "test", nil)
-	disabledFailed := job("lint-failed", "lint", pointerTo(false))
-	meta.SetStatusCondition(&disabledFailed.Status.Conditions, metav1.Condition{
-		Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobFailed", Message: "Failed",
-	})
-	disabledQueued := job("lint-queued", "lint", pointerTo(false))
-	clusterClient := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobQueuedIndex, indexQueuedWorkflowJob).
-		WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobProjectNameIndex, indexWorkflowJobProjectName).
-		WithStatusSubresource(&actionsv1alpha1.Runner{}, &actionsv1alpha1.WorkflowJob{}).
-		WithObjects(project, run, runnerObject, failed, blocked, unrelated, disabledFailed, disabledQueued).
-		Build()
-	reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
+	for _, tolerated := range []bool{false, true} {
+		t.Run(fmt.Sprintf("continue-on-error=%t", tolerated), func(t *testing.T) {
+			scheme := runnerTestScheme(t)
+			project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: types.UID("project-uid")}}
+			run := &actionsv1alpha1.WorkflowRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "release", Namespace: "default", UID: types.UID("run-uid")},
+				Status: actionsv1alpha1.WorkflowRunStatus{Conditions: []metav1.Condition{
+					plannedCondition(metav1.ConditionTrue, "JobsPlanned"),
+				}},
+			}
+			runnerObject := &actionsv1alpha1.Runner{
+				ObjectMeta: metav1.ObjectMeta{Name: "runner-1", Namespace: "default", UID: "runner-1"},
+				Spec:       actionsv1alpha1.RunnerSpec{Labels: []string{"ubuntu-latest"}},
+			}
+			job := func(name, logicalID string, failFast *bool) *actionsv1alpha1.WorkflowJob {
+				return &actionsv1alpha1.WorkflowJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: name, Namespace: "default",
+						Labels:      map[string]string{actionsv1alpha1.LabelProjectUID: string(project.UID), actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)},
+						Annotations: map[string]string{actionsv1alpha1.AnnotationProjectName: project.Name},
+					},
+					Spec: actionsv1alpha1.WorkflowJobSpec{
+						WorkflowRunRef: corev1.LocalObjectReference{Name: run.Name}, JobID: name, RunsOn: []string{"ubuntu-latest"},
+						Matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: logicalID, Values: map[string]string{"case": name}, MaxParallel: 1, FailFast: failFast},
+					},
+				}
+			}
+			failed := job("build-failed", "build", nil)
+			failed.Spec.ContinueOnError = tolerated
+			meta.SetStatusCondition(&failed.Status.Conditions, metav1.Condition{
+				Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobFailed", Message: "Failed",
+			})
+			blocked := job("build-queued", "build", nil)
+			unrelated := job("test-queued", "test", nil)
+			disabledFailed := job("lint-failed", "lint", pointerTo(false))
+			meta.SetStatusCondition(&disabledFailed.Status.Conditions, metav1.Condition{
+				Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobFailed", Message: "Failed",
+			})
+			disabledQueued := job("lint-queued", "lint", pointerTo(false))
+			clusterClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobQueuedIndex, indexQueuedWorkflowJob).
+				WithIndex(&actionsv1alpha1.WorkflowJob{}, workflowJobProjectNameIndex, indexWorkflowJobProjectName).
+				WithStatusSubresource(&actionsv1alpha1.Runner{}, &actionsv1alpha1.WorkflowJob{}).
+				WithObjects(project, run, runnerObject, failed, blocked, unrelated, disabledFailed, disabledQueued).
+				Build()
+			reconciler := &RunnerReconciler{Client: clusterClient, APIReader: clusterClient}
 
-	claimed, err := reconciler.claimWorkflowJob(context.Background(), runnerObject, project)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if claimed == nil || claimed.Name != disabledQueued.Name {
-		t.Fatalf("claim after matrix failure = %#v", claimed)
+			claimed, err := reconciler.claimWorkflowJob(context.Background(), runnerObject, project)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := disabledQueued.Name
+			if tolerated {
+				want = blocked.Name
+			}
+			if claimed == nil || claimed.Name != want {
+				t.Fatalf("claim after matrix failure = %#v", claimed)
+			}
+
+		})
 	}
 }
 
