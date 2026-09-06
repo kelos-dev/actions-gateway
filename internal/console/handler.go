@@ -1652,17 +1652,17 @@ func (h *Handler) streamJobLogs(writer http.ResponseWriter, request *http.Reques
 	defer batchTicker.Stop()
 	// Log IDs are positions in the currently retained Pod log, not durable offsets across log rotation.
 	var logID uint64
-	batch := make([]json.RawMessage, 0, logBatchEntryLimit)
-	batchBytes := 0
+	batch := make([]byte, 0, logBatchByteLimit+1)
+	batchEntries := 0
 	var batchLastLogID uint64
 	flushBatch := func() {
-		if len(batch) == 0 {
+		if batchEntries == 0 {
 			return
 		}
+		batch = append(batch, ']')
 		writeLogEvent(writer, flusher, batchLastLogID, batch)
-		clear(batch)
 		batch = batch[:0]
-		batchBytes = 0
+		batchEntries = 0
 	}
 	for {
 		select {
@@ -1676,13 +1676,18 @@ func (h *Handler) streamJobLogs(writer http.ResponseWriter, request *http.Reques
 				if logID > lastLogID {
 					encoded, _ := json.Marshal(result.entry)
 					entryBytes := len(encoded) + 1
-					if len(batch) > 0 && (len(batch) == logBatchEntryLimit || batchBytes+entryBytes > logBatchByteLimit) {
+					if batchEntries > 0 && len(batch)+entryBytes > logBatchByteLimit {
 						flushBatch()
 					}
-					batch = append(batch, encoded)
-					batchBytes += entryBytes
+					if batchEntries == 0 {
+						batch = append(batch, '[')
+					} else {
+						batch = append(batch, ',')
+					}
+					batch = append(batch, encoded...)
+					batchEntries++
 					batchLastLogID = logID
-					if len(batch) == logBatchEntryLimit || batchBytes >= logBatchByteLimit {
+					if batchEntries == logBatchEntryLimit || len(batch) >= logBatchByteLimit {
 						flushBatch()
 					}
 				}
@@ -1938,9 +1943,10 @@ func writeEvent(writer io.Writer, flusher http.Flusher, event string, value any)
 	flusher.Flush()
 }
 
-func writeLogEvent(writer io.Writer, flusher http.Flusher, id uint64, value any) {
-	encoded, _ := json.Marshal(value)
-	_, _ = fmt.Fprintf(writer, "id: %d\nevent: log\ndata: %s\n\n", id, encoded)
+func writeLogEvent(writer io.Writer, flusher http.Flusher, id uint64, encoded []byte) {
+	_, _ = fmt.Fprintf(writer, "id: %d\nevent: log\ndata: ", id)
+	_, _ = writer.Write(encoded)
+	_, _ = io.WriteString(writer, "\n\n")
 	flusher.Flush()
 }
 

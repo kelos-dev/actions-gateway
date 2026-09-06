@@ -237,9 +237,11 @@ func (p *ansiTextParser) reset() {
 }
 
 func (p *ansiTextParser) format(value string) (string, []logTextPart) {
+	if p.style == (ansiStyle{}) && !strings.ContainsRune(value, '\x1b') {
+		return value, nil
+	}
 	var plain strings.Builder
 	var parts []logTextPart
-	hasANSI := false
 	for position := 0; position < len(value); {
 		escape := strings.IndexByte(value[position:], '\x1b')
 		if escape < 0 {
@@ -248,11 +250,7 @@ func (p *ansiTextParser) format(value string) (string, []logTextPart) {
 		}
 		escape += position
 		p.appendText(&plain, &parts, value[position:escape])
-		hasANSI = true
 		position = p.consumeEscape(value, escape)
-	}
-	if !hasANSI && len(parts) == 1 && parts[0] == (logTextPart{Text: value}) {
-		return value, nil
 	}
 	return plain.String(), parts
 }
