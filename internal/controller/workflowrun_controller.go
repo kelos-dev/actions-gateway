@@ -195,7 +195,7 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 	if !run.DeletionTimestamp.IsZero() {
 		return r.finalizeCanceledWorkflowRun(ctx, run)
 	}
-	reportError := errors.Join(r.reconcileGitHubStatus(ctx, run), r.reconcileGitHubJobStatuses(ctx, run))
+	reportError := r.reconcileGitHubJobStatuses(ctx, run)
 	result, reconcileError := r.reconcileWorkflowRun(ctx, run)
 	if reconcileError != nil {
 		return result, errors.Join(reportError, reconcileError)
@@ -538,6 +538,9 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	if err != nil {
 		return r.planningFailed(ctx, run, "WorkflowInvalid", err, planningFailureTerminal)
 	}
+	if definition.Name == "" {
+		definition.Name = run.Spec.WorkflowPath
+	}
 	if err := r.ensureWorkflowFileSnapshot(ctx, run, workflowData); err != nil {
 		return r.planningFailed(ctx, run, "ChildCreationFailed", err, childCreationFailureDisposition(err))
 	}
@@ -776,114 +779,8 @@ type githubStatusOwner struct {
 	LeaseUntil int64  `json:"leaseUntil,omitempty"`
 }
 
-func (r *WorkflowRunReconciler) reconcileGitHubStatus(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
-	githubSource := run.Spec.Source.GitHub
-	if !r.githubStatusEnabled(run) {
-		return nil
-	}
-	project := &actionsv1alpha1.Project{}
-	projectKey := client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.ProjectRef.Name}
-	if err := r.APIReader.Get(ctx, projectKey, project); err != nil {
-		return fmt.Errorf("get Project %q for GitHub status: %w", projectKey.Name, err)
-	}
-	statusKey := githubStatusKey(project.UID, run)
-	projectMatches, err := r.ensureGitHubStatusIdentityLabels(ctx, run, project.UID, statusKey)
-	if err != nil {
-		return err
-	}
-	if !projectMatches {
-		return nil
-	}
-	report, targetRun, err := r.aggregateGitHubCommitStatusReport(ctx, run, statusKey)
-	if err != nil {
-		return err
-	}
-	githubConfig := project.Spec.Source.GitHub
-	revision := githubStatusRevision(githubSource)
-	requestFor := func(report commitStatusReport, targetRun *actionsv1alpha1.WorkflowRun) githubclient.CreateCommitStatusRequest {
-		targetURL := ""
-		if r.ConsoleURL != "" {
-			targetURL = workflowRunConsoleURL(r.ConsoleURL, targetRun)
-		}
-		return githubclient.CreateCommitStatusRequest{
-			State:       report.State,
-			TargetURL:   targetURL,
-			Description: report.Description,
-			Context:     githubStatusContext(run.Spec.WorkflowPath),
-		}
-	}
-	request := requestFor(report, targetRun)
-	reportDigest := commitStatusReportDigest(request)
-	current := workflowRunCommitStatus(run)
-	if current != nil && current.State == actionsv1alpha1.GitHubCommitStatusState(report.State) && current.ReportDigest == reportDigest {
-		owned, err := r.githubStatusOwnershipMatchesRun(ctx, run, project, statusKey)
-		if err != nil {
-			return err
-		}
-		if owned {
-			return nil
-		}
-	}
-	currentOwner, leaseToken, err := r.githubStatusCurrentOwner(ctx, run, project, statusKey)
-	if err != nil {
-		return err
-	}
-	if !currentOwner {
-		return nil
-	}
-	report, targetRun, err = r.aggregateGitHubCommitStatusReport(ctx, run, statusKey)
-	if err != nil {
-		return errors.Join(err, r.releaseGitHubStatusLease(ctx, run.Namespace, statusKey, leaseToken))
-	}
-	request = requestFor(report, targetRun)
-	reportDigest = commitStatusReportDigest(request)
-	reportError := func() error {
-		privateKey, err := secretValue(ctx, r.APIReader, project.Namespace, githubConfig.PrivateKeySecretRef)
-		if err != nil {
-			return fmt.Errorf("read credentials for GitHub status: %w", err)
-		}
-		installation, err := r.GitHub.CachedInstallation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, githubSource.Repository.Name, githubclient.InstallationPermissions{"statuses": "write"})
-		if err != nil {
-			return fmt.Errorf("authenticate GitHub status reporter: %w", err)
-		}
-		statuses, err := installation.ListCommitStatuses(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, revision)
-		if err != nil {
-			return err
-		}
-		for index := range statuses {
-			status := &statuses[index]
-			if !strings.EqualFold(status.Context, request.Context) {
-				continue
-			}
-			if !commitStatusMatches(status, request) {
-				break
-			}
-			appBotLogin, err := r.GitHub.AppBotLogin(ctx, githubConfig.AppID, privateKey)
-			if err != nil {
-				return fmt.Errorf("identify GitHub status reporter: %w", err)
-			}
-			if !strings.EqualFold(status.Creator.Login, appBotLogin) {
-				break
-			}
-			if status.ID < 1 {
-				return errors.New("GitHub returned an invalid commit-status ID")
-			}
-			return r.recordGitHubCommitStatus(ctx, run, report.State, reportDigest)
-		}
-		status, err := installation.CreateCommitStatus(ctx, githubSource.Repository.Owner, githubSource.Repository.Name, revision, request)
-		if err != nil {
-			return err
-		}
-		if status == nil || status.ID < 1 {
-			return errors.New("GitHub returned an invalid commit-status ID")
-		}
-		return r.recordGitHubCommitStatus(ctx, run, report.State, reportDigest)
-	}()
-	return errors.Join(reportError, r.releaseGitHubStatusLease(ctx, run.Namespace, statusKey, leaseToken))
-}
-
 func (r *WorkflowRunReconciler) reconcileGitHubJobStatuses(ctx context.Context, run *actionsv1alpha1.WorkflowRun) error {
-	if !r.githubStatusEnabled(run) {
+	if !r.githubStatusEnabled(run) || run.Status.WorkflowName == "" {
 		return nil
 	}
 	jobs := &actionsv1alpha1.WorkflowJobList{}
@@ -901,12 +798,16 @@ func (r *WorkflowRunReconciler) reconcileGitHubJobStatuses(ctx context.Context, 
 	}
 	desired := make([]jobCommitStatusUpdate, 0, len(jobs.Items))
 	updates := make([]jobCommitStatusUpdate, 0, len(jobs.Items))
+	checkContextCollisions := false
 	for index := range jobs.Items {
 		job := &jobs.Items[index]
 		report := workflowJobCommitStatusReport(run, job)
 		request := workflowJobCommitStatusRequest(r.ConsoleURL, run, job, report)
 		digest := commitStatusReportDigest(request)
 		current := workflowJobCommitStatus(job)
+		if current == nil {
+			checkContextCollisions = true
+		}
 		item := jobCommitStatusUpdate{job: job, request: request, report: report, reportDigest: digest}
 		desired = append(desired, item)
 		if current != nil && current.State == actionsv1alpha1.GitHubCommitStatusState(report.State) && current.ReportDigest == digest {
@@ -916,6 +817,11 @@ func (r *WorkflowRunReconciler) reconcileGitHubJobStatuses(ctx context.Context, 
 	}
 	if len(desired) == 0 {
 		return nil
+	}
+	if checkContextCollisions {
+		if err := r.warnGitHubJobStatusContextCollision(ctx, run, jobs.Items); err != nil {
+			return err
+		}
 	}
 
 	project := &actionsv1alpha1.Project{}
@@ -1018,86 +924,6 @@ func (r *WorkflowRunReconciler) reconcileGitHubJobStatuses(ctx context.Context, 
 
 func commitStatusMatches(status *githubclient.CommitStatus, request githubclient.CreateCommitStatusRequest) bool {
 	return strings.EqualFold(status.Context, request.Context) && status.State == request.State && status.TargetURL == request.TargetURL && status.Description == request.Description
-}
-
-func (r *WorkflowRunReconciler) aggregateGitHubCommitStatusReport(ctx context.Context, run *actionsv1alpha1.WorkflowRun, statusKey string) (commitStatusReport, *actionsv1alpha1.WorkflowRun, error) {
-	runs := &actionsv1alpha1.WorkflowRunList{}
-	if err := r.APIReader.List(ctx, runs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelGitHubStatusKey: statusKey}); err != nil {
-		return commitStatusReport{}, nil, err
-	}
-	report, targetRun := aggregateGitHubCommitStatusReports(run, runs.Items)
-	return report, targetRun, nil
-}
-
-func aggregateGitHubCommitStatusReports(run *actionsv1alpha1.WorkflowRun, runs []actionsv1alpha1.WorkflowRun) (commitStatusReport, *actionsv1alpha1.WorkflowRun) {
-	latestByExecution := map[string]*actionsv1alpha1.WorkflowRun{}
-	for index := range runs {
-		candidate := &runs[index]
-		if candidate.UID == run.UID {
-			candidate = run
-		}
-		if !githubStatusKeyMatches(candidate, run) {
-			continue
-		}
-		execution := githubStatusExecutionIdentity(candidate)
-		if current := latestByExecution[execution]; current == nil || workflowRunIsNewer(candidate, current) {
-			latestByExecution[execution] = candidate
-		}
-	}
-	if len(latestByExecution) == 0 {
-		return workflowRunCommitStatusReport(run), run
-	}
-	if len(latestByExecution) == 1 {
-		for _, selected := range latestByExecution {
-			return workflowRunCommitStatusReport(selected), selected
-		}
-	}
-
-	state := "success"
-	targetRun := run
-	targetPriority := -1
-	for _, selected := range latestByExecution {
-		selectedState := workflowRunCommitStatusReport(selected).State
-		priority := 0
-		switch selectedState {
-		case "error":
-			state = "error"
-			priority = 3
-		case "failure":
-			if state != "error" {
-				state = "failure"
-			}
-			priority = 2
-		case "pending":
-			if state == "success" {
-				state = "pending"
-			}
-			priority = 1
-		}
-		if priority > targetPriority || priority == targetPriority && workflowRunIsNewer(selected, targetRun) {
-			targetRun = selected
-			targetPriority = priority
-		}
-	}
-	count := len(latestByExecution)
-	description := fmt.Sprintf("All %d matching workflow runs succeeded", count)
-	switch state {
-	case "error":
-		description = fmt.Sprintf("%d matching workflow runs include an error", count)
-	case "failure":
-		description = fmt.Sprintf("%d matching workflow runs include a failure", count)
-	case "pending":
-		description = fmt.Sprintf("%d matching workflow runs are pending", count)
-	}
-	return commitStatusReport{State: state, Description: description}, targetRun
-}
-
-func githubStatusExecutionIdentity(run *actionsv1alpha1.WorkflowRun) string {
-	source := run.Spec.Source.GitHub
-	if source.Event.Name == actionsv1alpha1.GitHubEventNamePullRequest && source.Event.PullRequest != nil {
-		return fmt.Sprintf("%s\x00%d", source.Event.Name, source.Event.PullRequest.Number)
-	}
-	return fmt.Sprintf("%s\x00%s", source.Event.Name, source.Revision.Ref)
 }
 
 func (r *WorkflowRunReconciler) ensureGitHubStatusIdentityLabels(ctx context.Context, run *actionsv1alpha1.WorkflowRun, projectUID types.UID, statusKey string) (bool, error) {
@@ -1357,7 +1183,7 @@ func githubStatusKeyMatches(left, right *actionsv1alpha1.WorkflowRun) bool {
 		left.Labels[actionsv1alpha1.LabelProjectUID] != "" && left.Labels[actionsv1alpha1.LabelProjectUID] == right.Labels[actionsv1alpha1.LabelProjectUID] &&
 		leftSource.Repository.ID == rightSource.Repository.ID &&
 		githubStatusRevision(leftSource) == githubStatusRevision(rightSource) &&
-		strings.EqualFold(githubStatusContext(left.Spec.WorkflowPath), githubStatusContext(right.Spec.WorkflowPath))
+		strings.EqualFold(githubWorkflowPathIdentity(left.Spec.WorkflowPath), githubWorkflowPathIdentity(right.Spec.WorkflowPath))
 }
 
 func workflowRunIsNewer(candidate, current *actionsv1alpha1.WorkflowRun) bool {
@@ -1393,18 +1219,53 @@ func githubStatusRevision(source *actionsv1alpha1.GitHubWorkflowRunSource) strin
 	return source.Revision.SHA
 }
 
-func githubStatusContext(workflowPath string) string {
+func githubWorkflowPathIdentity(workflowPath string) string {
 	context := "Open Actions / " + workflowPath
-	digest := sha256.Sum256([]byte(context))
-	suffix := fmt.Sprintf(" / %x", digest[:8])
-	runes := []rune(context)
-	if workflowPath == strings.ToLower(workflowPath) && len(runes) <= maxCommitStatusContextRunes {
-		return context
+	return boundedGitHubStatusContext(context, workflowPath != strings.ToLower(workflowPath))
+}
+
+func githubWorkflowDisplayName(run *actionsv1alpha1.WorkflowRun) string {
+	if run.Status.WorkflowName != "" {
+		return run.Status.WorkflowName
 	}
-	if len(runes)+len(suffix) <= maxCommitStatusContextRunes {
-		return context + suffix
+	return run.Spec.WorkflowPath
+}
+
+func (r *WorkflowRunReconciler) warnGitHubJobStatusContextCollision(ctx context.Context, run *actionsv1alpha1.WorkflowRun, jobs []actionsv1alpha1.WorkflowJob) error {
+	if r.Recorder == nil {
+		return nil
 	}
-	return string(runes[:maxCommitStatusContextRunes-len(suffix)]) + suffix
+	runs := &actionsv1alpha1.WorkflowRunList{}
+	if err := r.APIReader.List(ctx, runs, client.InNamespace(run.Namespace)); err != nil {
+		return fmt.Errorf("list WorkflowRuns for GitHub job status contexts on WorkflowRun %q: %w", run.Name, err)
+	}
+	source := run.Spec.Source.GitHub
+	for index := range runs.Items {
+		candidate := &runs.Items[index]
+		candidateSource := candidate.Spec.Source.GitHub
+		if candidate.UID == run.UID || candidate.Spec.ProjectRef != run.Spec.ProjectRef || candidateSource == nil || !r.githubStatusEnabled(candidate) ||
+			candidateSource.Repository.ID != source.Repository.ID || githubStatusRevision(candidateSource) != githubStatusRevision(source) ||
+			candidate.Spec.WorkflowPath == run.Spec.WorkflowPath || candidate.Status.WorkflowName == "" {
+			continue
+		}
+		candidateJobs := &actionsv1alpha1.WorkflowJobList{}
+		if err := r.APIReader.List(ctx, candidateJobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(candidate.UID)}); err != nil {
+			return fmt.Errorf("list WorkflowJobs for GitHub status context collision with WorkflowRun %q: %w", candidate.Name, err)
+		}
+		for currentIndex := range jobs {
+			contextName := githubJobStatusContext(run, &jobs[currentIndex])
+			for candidateIndex := range candidateJobs.Items {
+				candidateJob := &candidateJobs.Items[candidateIndex]
+				if !strings.EqualFold(githubJobStatusContext(candidate, candidateJob), contextName) {
+					continue
+				}
+				r.Recorder.Eventf(run, candidateJob, corev1.EventTypeWarning, "GitHubStatusContextCollision", "ReportStatus",
+					"GitHub job status context %q also identifies WorkflowJob %q from workflow %q; workflow and job names that report the same commit must produce unique contexts ignoring case", contextName, candidateJob.Name, candidate.Spec.WorkflowPath)
+				return nil
+			}
+		}
+	}
+	return nil
 }
 
 func githubJobStatusContext(run *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob) string {
@@ -1416,15 +1277,19 @@ func githubJobStatusContext(run *actionsv1alpha1.WorkflowRun, job *actionsv1alph
 	if job.Spec.Matrix != nil {
 		jobID = job.Spec.Matrix.LogicalJobID
 	}
-	context := "Open Actions / " + run.Spec.WorkflowPath + " / " + displayName
+	context := "Open Actions / " + githubWorkflowDisplayName(run) + " / " + displayName
 	if displayName != jobID {
 		context += " / " + jobID
 	}
+	caseIdentity := run.Spec.WorkflowPath + "\x00" + jobID
+	return boundedGitHubStatusContext(context, caseIdentity != strings.ToLower(caseIdentity))
+}
+
+func boundedGitHubStatusContext(context string, disambiguateCase bool) string {
 	digest := sha256.Sum256([]byte(context))
 	suffix := fmt.Sprintf(" / %x", digest[:8])
 	runes := []rune(context)
-	caseIdentity := run.Spec.WorkflowPath + "\x00" + jobID
-	if caseIdentity == strings.ToLower(caseIdentity) && len(runes) <= maxCommitStatusContextRunes {
+	if !disambiguateCase && len(runes) <= maxCommitStatusContextRunes {
 		return context
 	}
 	if len(runes)+len(suffix) <= maxCommitStatusContextRunes {
@@ -1443,7 +1308,7 @@ func githubStatusKey(projectUID types.UID, run *actionsv1alpha1.WorkflowRun) str
 	default:
 		return ""
 	}
-	key := fmt.Sprintf("%s\x00%d\x00%s\x00%s", projectUID, source.Repository.ID, githubStatusRevision(source), strings.ToLower(githubStatusContext(run.Spec.WorkflowPath)))
+	key := fmt.Sprintf("%s\x00%d\x00%s\x00%s", projectUID, source.Repository.ID, githubStatusRevision(source), strings.ToLower(githubWorkflowPathIdentity(run.Spec.WorkflowPath)))
 	digest := sha256.Sum256([]byte(key))
 	return strings.ToLower(digestEncoding.EncodeToString(digest[:]))
 }
@@ -1452,40 +1317,6 @@ func commitStatusReportDigest(request githubclient.CreateCommitStatusRequest) st
 	data, _ := json.Marshal(request)
 	digest := sha256.Sum256(data)
 	return fmt.Sprintf("%x", digest)
-}
-
-func workflowRunCommitStatusReport(run *actionsv1alpha1.WorkflowRun) commitStatusReport {
-	report := commitStatusReport{State: "pending", Description: "The workflow is queued"}
-	if policy := run.Spec.ForkPullRequest; policy != nil && policy.RequireApproval && !policy.Approved {
-		report.Description = "The workflow is waiting for approval"
-	}
-	succeeded := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
-	switch {
-	case succeeded != nil && succeeded.Status == metav1.ConditionTrue:
-		report.State = "success"
-		report.Description = commitStatusDescription(succeeded.Message, "The workflow succeeded")
-	case succeeded != nil && succeeded.Status == metav1.ConditionFalse:
-		report.State = "failure"
-		switch succeeded.Reason {
-		case "JobCancelled", "JobTimedOut", "RevisionSuperseded":
-			report.State = "error"
-		}
-		report.Description = commitStatusDescription(succeeded.Message, "The workflow failed")
-	case !run.DeletionTimestamp.IsZero():
-		report.State = "error"
-		report.Description = "The workflow was cancelled"
-	case run.Status.StartTime != nil:
-		report.Description = "The workflow is running"
-	default:
-		planned := meta.FindStatusCondition(run.Status.Conditions, actionsv1alpha1.WorkflowRunConditionPlanned)
-		if planned != nil && planned.Message != "" {
-			report.Description = commitStatusDescription(planned.Message, report.Description)
-		}
-	}
-	if run.Spec.Rerun != nil {
-		report.Description = commitStatusDescription(fmt.Sprintf("Attempt %d: %s", run.Spec.Rerun.Attempt, report.Description), report.Description)
-	}
-	return report
 }
 
 func workflowJobCommitStatusReport(run *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob) commitStatusReport {
@@ -1558,30 +1389,11 @@ func commitStatusDescription(description, fallback string) string {
 	return description
 }
 
-func workflowRunCommitStatus(run *actionsv1alpha1.WorkflowRun) *actionsv1alpha1.GitHubCommitStatus {
-	if run.Status.Source == nil || run.Status.Source.GitHub == nil {
-		return nil
-	}
-	return run.Status.Source.GitHub.CommitStatus
-}
-
 func workflowJobCommitStatus(job *actionsv1alpha1.WorkflowJob) *actionsv1alpha1.GitHubCommitStatus {
 	if job.Status.Source == nil || job.Status.Source.GitHub == nil {
 		return nil
 	}
 	return job.Status.Source.GitHub.CommitStatus
-}
-
-func (r *WorkflowRunReconciler) recordGitHubCommitStatus(ctx context.Context, run *actionsv1alpha1.WorkflowRun, state, reportDigest string) error {
-	before := run.DeepCopy()
-	if run.Status.Source == nil {
-		run.Status.Source = &actionsv1alpha1.WorkflowRunSourceStatus{}
-	}
-	if run.Status.Source.GitHub == nil {
-		run.Status.Source.GitHub = &actionsv1alpha1.GitHubWorkflowRunStatus{}
-	}
-	run.Status.Source.GitHub.CommitStatus = &actionsv1alpha1.GitHubCommitStatus{State: actionsv1alpha1.GitHubCommitStatusState(state), ReportDigest: reportDigest}
-	return r.Status().Patch(ctx, run, client.MergeFrom(before))
 }
 
 func (r *WorkflowRunReconciler) recordGitHubJobCommitStatus(ctx context.Context, job *actionsv1alpha1.WorkflowJob, state, reportDigest string) error {
@@ -4291,7 +4103,7 @@ func (r *WorkflowRunReconciler) finalizeCanceledWorkflowRun(ctx context.Context,
 	}
 	var reportError error
 	if statusFinalizer {
-		reportError = errors.Join(r.reconcileGitHubStatus(ctx, run), r.reconcileGitHubJobStatuses(ctx, run))
+		reportError = r.reconcileGitHubJobStatuses(ctx, run)
 	}
 	if statusFinalizer && reportError == nil {
 		reportError = r.releaseGitHubStatusOwnershipIfUnused(ctx, run)

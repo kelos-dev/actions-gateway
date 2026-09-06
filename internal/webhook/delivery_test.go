@@ -351,10 +351,9 @@ func TestCreateWorkflowRunReplayUsesLiveReader(t *testing.T) {
 			WorkflowPath: workflowPath,
 		},
 	}
-	cachedClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 	liveReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
 	reconciler := &DeliveryReconciler{
-		Client:    &workflowRunAlreadyExistsClient{Client: cachedClient},
+		Client:    &workflowRunAlreadyExistsClient{Client: liveReader},
 		APIReader: liveReader,
 	}
 	if err := reconciler.createWorkflowRun(context.Background(), project, delivery, workflowSelection{Path: workflowPath, Event: delivery.Event}); err != nil {

@@ -775,11 +775,7 @@ func workflowRunRevision(event normalizedEvent) actionsv1alpha1.GitRevision {
 
 func matchingWorkflowRun(existing, desired *actionsv1alpha1.WorkflowRun) error {
 	if existing.Annotations[eventsnapshot.Annotation] != desired.Annotations[eventsnapshot.Annotation] {
-		return apierrors.NewConflict(
-			actionsv1alpha1.GroupVersion.WithResource("workflowruns").GroupResource(),
-			existing.Name,
-			errors.New("existing WorkflowRun does not match the webhook delivery"),
-		)
+		return workflowRunDeliveryConflict(existing.Name)
 	}
 	existingSpec := existing.Spec.DeepCopy()
 	desiredSpec := desired.Spec.DeepCopy()
@@ -798,9 +794,13 @@ func matchingWorkflowRun(existing, desired *actionsv1alpha1.WorkflowRun) error {
 	if apiequality.Semantic.DeepEqual(existingSpec, desiredSpec) {
 		return nil
 	}
+	return workflowRunDeliveryConflict(existing.Name)
+}
+
+func workflowRunDeliveryConflict(name string) error {
 	return apierrors.NewConflict(
 		actionsv1alpha1.GroupVersion.WithResource("workflowruns").GroupResource(),
-		existing.Name,
+		name,
 		errors.New("existing WorkflowRun does not match the webhook delivery"),
 	)
 }

@@ -54,6 +54,20 @@ func TestWorkflowRunAcceptsCommitStatusErrorState(t *testing.T) {
 	}
 }
 
+func TestWorkflowRunAcceptsWorkflowPathAsWorkflowName(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
+	object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
+	normalizeWorkflowRunCELIntegers(object)
+	object["status"] = map[string]any{"workflowName": strings.Repeat("w", 512)}
+	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
+		t.Fatalf("maximum workflow path display name was rejected: %v", errs.ToAggregate())
+	}
+	object["status"].(map[string]any)["workflowName"] = strings.Repeat("w", 513)
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("oversized workflow path display name passed validation")
+	}
+}
+
 func TestWorkflowRunTTLIsMutable(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
 	original := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
@@ -650,27 +664,6 @@ func TestWorkflowRunAcceptsManagedUserOwner(t *testing.T) {
 	workflowRunGitHub(object)["repository"].(map[string]any)["owner"] = "octocat_enterprise"
 	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
 		t.Fatalf("managed user repository owner was rejected: %v", errs.ToAggregate())
-	}
-}
-
-func TestWorkflowRunAcceptsGitHubCommitStatusContract(t *testing.T) {
-	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
-	object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
-	object["status"] = map[string]any{"source": map[string]any{"github": map[string]any{"commitStatus": map[string]any{
-		"state": "success", "reportDigest": strings.Repeat("a", 64),
-	}}}}
-	if errs := validateObject(t, crd, object, nil); len(errs) > 0 {
-		t.Fatalf("valid GitHub commit status was rejected: %v", errs.ToAggregate())
-	}
-	commitStatus := object["status"].(map[string]any)["source"].(map[string]any)["github"].(map[string]any)["commitStatus"].(map[string]any)
-	commitStatus["state"] = "cancelled"
-	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
-		t.Fatal("GitHub commit status with an invalid state was accepted")
-	}
-	commitStatus["state"] = "success"
-	commitStatus["reportDigest"] = "invalid"
-	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
-		t.Fatal("GitHub commit status with an invalid report digest was accepted")
 	}
 }
 

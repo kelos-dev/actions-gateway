@@ -172,6 +172,30 @@ type WorkflowJobMatrix struct {
 	FailFast *bool `json:"failFast,omitempty"`
 }
 
+// GitHubCommitStatusState is a state accepted by GitHub's commit-status API.
+type GitHubCommitStatusState string
+
+const (
+	GitHubCommitStatusStateError   GitHubCommitStatusState = "error"
+	GitHubCommitStatusStateFailure GitHubCommitStatusState = "failure"
+	GitHubCommitStatusStatePending GitHubCommitStatusState = "pending"
+	GitHubCommitStatusStateSuccess GitHubCommitStatusState = "success"
+)
+
+// GitHubCommitStatus records a GitHub commit status managed by Open Actions.
+type GitHubCommitStatus struct {
+	// State is the last commit-status state accepted by GitHub.
+	// +kubebuilder:validation:Enum=error;failure;pending;success
+	// +required
+	State GitHubCommitStatusState `json:"state"`
+
+	// ReportDigest is the SHA-256 digest of the commit-status fields last
+	// accepted by GitHub.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	// +optional
+	ReportDigest string `json:"reportDigest,omitempty"`
+}
+
 // GitHubWorkflowJobStatus contains GitHub observations for a WorkflowJob.
 type GitHubWorkflowJobStatus struct {
 	// CommitStatus is the GitHub commit status that reports this WorkflowJob.

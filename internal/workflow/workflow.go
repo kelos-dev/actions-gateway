@@ -368,9 +368,6 @@ func Parse(data []byte) (*Definition, error) {
 		}
 		return nil, fmt.Errorf("workflow must contain exactly one YAML document")
 	}
-	if definition.Name == "" {
-		return nil, fmt.Errorf("workflow must define a name")
-	}
 	if utf8.RuneCountInString(definition.Name) > maxWorkflowNameLength {
 		return nil, fmt.Errorf("workflow name exceeds %d characters", maxWorkflowNameLength)
 	}
