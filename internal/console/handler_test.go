@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -361,6 +362,62 @@ func TestConsoleBatchesLogStream(t *testing.T) {
 			}
 			if entries != test.entryCount {
 				t.Fatalf("log stream contains %d entries, want %d", entries, test.entryCount)
+			}
+		})
+	}
+}
+
+func TestConsoleLogStreamPreservesBatchContent(t *testing.T) {
+	tests := []struct {
+		name  string
+		line  string
+		entry logEntry
+		count int
+	}{
+		{
+			name: "escaped output", line: "\"quoted\" \\path\t<script> & 日本語 👋",
+			entry: logEntry{Kind: "output", Text: "\"quoted\" \\path\t<script> & 日本語 👋"}, count: logBatchEntryLimit + 1,
+		},
+		{
+			name: "multiline annotation", line: "::notice title=Test::first%0Asecond",
+			entry: logEntry{Kind: "notice", Text: "first\nsecond", Properties: map[string]string{"title": "Test"}}, count: logBatchEntryLimit + 1,
+		},
+		{
+			name: "styled output", line: "\x1b[32mgreen\x1b[0m",
+			entry: logEntry{Kind: "output", Text: "green", Parts: []logTextPart{{Text: "green", Foreground: "#008000"}}}, count: logBatchEntryLimit + 1,
+		},
+		{
+			name: "oversized entry", line: strings.Repeat("x", logBatchByteLimit),
+			entry: logEntry{Kind: "output", Text: strings.Repeat("x", logBatchByteLimit)}, count: 2,
+		},
+		{name: "empty stream"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := newTestHandler(t, false)
+			handler.logs.(*testLogSource).logs = strings.Repeat(test.line+"\n", test.count)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/runs/default/ci/jobs/build/stream", nil))
+			if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "event: end\n") {
+				t.Fatalf("log stream = %d, %q", response.Code, response.Body.String())
+			}
+			count := 0
+			for _, batch := range parseTestLogBatches(t, response.Body.String()) {
+				if len(batch.entries) == 0 {
+					t.Fatal("log stream contains an empty batch")
+				}
+				for _, entry := range batch.entries {
+					if !reflect.DeepEqual(entry, test.entry) {
+						t.Fatalf("entry = %#v, want %#v", entry, test.entry)
+					}
+				}
+				count += len(batch.entries)
+				if batch.id != uint64(count) {
+					t.Fatalf("batch ID = %d, want %d", batch.id, count)
+				}
+			}
+			if count != test.count {
+				t.Fatalf("log stream contains %d entries, want %d", count, test.count)
 			}
 		})
 	}
@@ -1588,7 +1645,7 @@ func TestSafeNextRejectsExternalURLs(t *testing.T) {
 	}
 }
 
-func newTestHandler(t *testing.T, secureCookie bool) *Handler {
+func newTestHandler(t testing.TB, secureCookie bool) *Handler {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {

@@ -201,6 +201,10 @@ func TestActionLogParserCarriesANSIStyleAcrossLines(t *testing.T) {
 	if !visible || first.Text != "red" || !reflect.DeepEqual(first.Parts, []logTextPart{{Text: "red", Foreground: "#800000"}}) {
 		t.Fatalf("first entry = %#v, %t", first, visible)
 	}
+	continued, visible := parser.parse("still red")
+	if !visible || continued.Text != "still red" || !reflect.DeepEqual(continued.Parts, []logTextPart{{Text: "still red", Foreground: "#800000"}}) {
+		t.Fatalf("continued entry = %#v, %t", continued, visible)
+	}
 	second, visible := parser.parse("continued\x1b[0m plain")
 	want := []logTextPart{{Text: "continued", Foreground: "#800000"}, {Text: " plain"}}
 	if !visible || second.Text != "continued plain" || !reflect.DeepEqual(second.Parts, want) {
@@ -209,6 +213,16 @@ func TestActionLogParserCarriesANSIStyleAcrossLines(t *testing.T) {
 	third, visible := parser.parse("unstyled")
 	if !visible || third.Text != "unstyled" || third.Parts != nil {
 		t.Fatalf("third entry = %#v, %t", third, visible)
+	}
+}
+
+func TestANSITextParserPreservesUnstyledText(t *testing.T) {
+	for _, value := range []string{"", "plain output", "日本語 output 👋", strings.Repeat("output ", 10000)} {
+		parser := &ansiTextParser{}
+		text, parts := parser.format(value)
+		if text != value || parts != nil {
+			t.Fatalf("unstyled text = %q, parts = %#v", text, parts)
+		}
 	}
 }
 
