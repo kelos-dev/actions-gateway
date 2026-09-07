@@ -295,11 +295,20 @@ protection with the resulting context.
 
 Each job status is `pending` until completion, then reports `success`, `failure`,
 or `error`. A running job remains `pending` because the GitHub commit-status API
-has no `in_progress` state; its description reports that the job is running.
-Commit-status descriptions are limited to 140 Unicode characters. The newest
-matching WorkflowRun owns the per-job contexts, so reports from older executions
-cannot replace its job statuses. A later execution for the same event and ref,
-or the same pull request, supersedes its earlier execution.
+has no `in_progress` state. Descriptions use `Queued`, `In progress`,
+`Successful`, `Failing`, `Timed out`, `Cancelled`, or `Skipped`. Completed jobs
+with recorded start and completion times include their execution duration, such
+as `Successful in 22s`, `Successful in 3m 2s`, `Failing after 8m 23s`, or
+`Cancelled after 22s`. Durations omit fractional seconds and zero-valued units;
+a duration shorter than one second is `0s`. Skipped jobs and jobs without a
+valid execution duration report only the status text. Reruns use the same
+description format. These summaries follow GitHub Actions' check presentation;
+the [status and conclusion semantics](https://docs.github.com/en/pull-requests/reference/status-checks#check-statuses-and-conclusions)
+are mapped to the commit-status API's available states.
+
+The newest matching WorkflowRun owns the per-job contexts, so reports from older
+executions cannot replace its job statuses. A later execution for the same event
+and ref, or the same pull request, supersedes its earlier execution.
 
 Scheduled and manually repeated triggers do not publish commit statuses because
 stable-revision recurring workflows could consume GitHub's per-commit,
