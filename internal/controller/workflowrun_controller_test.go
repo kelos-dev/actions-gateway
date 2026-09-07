@@ -2396,7 +2396,7 @@ func TestGitHubWorkflowJobCommitStatusLifecycle(t *testing.T) {
 		"Open Actions / CI / Lint / lint":   "https://console.example/runs/default/ci/jobs/ci-lint",
 	}
 	for _, report := range reports {
-		if report.State != "pending" || report.Description != "The workflow job is queued" || report.TargetURL != wantQueued[report.Context] {
+		if report.State != "pending" || report.Description != "Queued" || report.TargetURL != wantQueued[report.Context] {
 			t.Fatalf("queued job report = %#v", report)
 		}
 		delete(wantQueued, report.Context)
@@ -2437,12 +2437,14 @@ func TestGitHubWorkflowJobCommitStatusLifecycle(t *testing.T) {
 	if err := reconciler.reconcileGitHubJobStatuses(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
-	if len(reports) != 3 || reports[2].State != "pending" || reports[2].Description != "The workflow job is running" || reports[2].TargetURL != "https://console.example/runs/default/ci/jobs/ci-build" {
+	if len(reports) != 3 || reports[2].State != "pending" || reports[2].Description != "In progress" || reports[2].TargetURL != "https://console.example/runs/default/ci/jobs/ci-build" {
 		t.Fatalf("running job report = %#v, reports = %d", reports[len(reports)-1], len(reports))
 	}
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(build), storedBuild); err != nil {
 		t.Fatal(err)
 	}
+	completion := metav1.NewTime(start.Add(22 * time.Second))
+	storedBuild.Status.CompletionTime = &completion
 	storedBuild.Status.Result = actionsv1alpha1.WorkflowJobResultSuccess
 	meta.SetStatusCondition(&storedBuild.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionTrue, Reason: "JobSucceeded", Message: "All steps passed"})
 	if err := clusterClient.Status().Update(context.Background(), storedBuild); err != nil {
@@ -2451,7 +2453,7 @@ func TestGitHubWorkflowJobCommitStatusLifecycle(t *testing.T) {
 	if err := reconciler.reconcileGitHubJobStatuses(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
-	if len(reports) != 4 || reports[3].State != "success" || reports[3].Description != "All steps passed" {
+	if len(reports) != 4 || reports[3].State != "success" || reports[3].Description != "Successful in 22s" {
 		t.Fatalf("completed job report = %#v, reports = %d", reports[len(reports)-1], len(reports))
 	}
 	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(build), storedBuild); err != nil {
@@ -2599,7 +2601,7 @@ func TestGitHubWorkflowJobCommitStatusLifecycle(t *testing.T) {
 	if len(reports) != 7 {
 		t.Fatalf("deleting WorkflowRun reports = %#v", reports)
 	}
-	if report := reports[6]; report.Context != "Open Actions / CI / Lint / lint" || report.State != "error" || report.Description != "The workflow job was cancelled" || report.TargetURL != "https://console.example/runs/default/ci-pull-request/jobs/ci-pull-request-lint" {
+	if report := reports[6]; report.Context != "Open Actions / CI / Lint / lint" || report.State != "error" || report.Description != "Cancelled" || report.TargetURL != "https://console.example/runs/default/ci-pull-request/jobs/ci-pull-request-lint" {
 		t.Fatalf("canceled job report = %#v", report)
 	}
 }
@@ -2612,30 +2614,30 @@ func TestWorkflowJobCommitStatusReportMapsLifecycle(t *testing.T) {
 		state       string
 		description string
 	}{
-		{name: "queued", state: "pending", description: "The workflow job is queued"},
-		{name: "running", state: "pending", description: "The workflow job is running", configure: func(_ *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob) {
+		{name: "queued", state: "pending", description: "Queued"},
+		{name: "running", state: "pending", description: "In progress", configure: func(_ *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob) {
 			job.Status.StartTime = &completion
 		}},
-		{name: "success", state: "success", description: "The workflow job succeeded", configure: func(_ *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob) {
+		{name: "success", state: "success", description: "Successful", configure: func(_ *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob) {
 			job.Status.Result = actionsv1alpha1.WorkflowJobResultSuccess
 		}},
-		{name: "failure", state: "failure", description: "The workflow job failed", configure: func(_ *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob) {
+		{name: "failure", state: "failure", description: "Failing", configure: func(_ *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob) {
 			job.Status.Result = actionsv1alpha1.WorkflowJobResultFailure
 		}},
-		{name: "timeout", state: "error", description: "The workflow job timed out", configure: func(_ *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob) {
+		{name: "timeout", state: "error", description: "Timed out", configure: func(_ *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob) {
 			job.Status.Result = actionsv1alpha1.WorkflowJobResultFailure
 			meta.SetStatusCondition(&job.Status.Conditions, metav1.Condition{Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: metav1.ConditionFalse, Reason: "JobTimedOut"})
 		}},
-		{name: "skipped", state: "success", description: "The workflow job was skipped", configure: func(_ *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob) {
+		{name: "skipped", state: "success", description: "Skipped", configure: func(_ *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob) {
 			job.Status.Result = actionsv1alpha1.WorkflowJobResultSkipped
 		}},
-		{name: "cancelled", state: "error", description: "The workflow job was cancelled", configure: func(_ *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob) {
+		{name: "cancelled", state: "error", description: "Cancelled", configure: func(_ *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob) {
 			job.Status.Result = actionsv1alpha1.WorkflowJobResultCancelled
 		}},
-		{name: "deleting run", state: "error", description: "The workflow job was cancelled", configure: func(run *actionsv1alpha1.WorkflowRun, _ *actionsv1alpha1.WorkflowJob) {
+		{name: "deleting run", state: "error", description: "Cancelled", configure: func(run *actionsv1alpha1.WorkflowRun, _ *actionsv1alpha1.WorkflowJob) {
 			run.DeletionTimestamp = &completion
 		}},
-		{name: "rerun", state: "pending", description: "Attempt 2: The workflow job is queued", configure: func(run *actionsv1alpha1.WorkflowRun, _ *actionsv1alpha1.WorkflowJob) {
+		{name: "rerun", state: "pending", description: "Queued", configure: func(run *actionsv1alpha1.WorkflowRun, _ *actionsv1alpha1.WorkflowJob) {
 			run.Spec.Rerun = &actionsv1alpha1.WorkflowRunRerun{Attempt: 2}
 		}},
 	}
@@ -2649,6 +2651,78 @@ func TestWorkflowJobCommitStatusReportMapsLifecycle(t *testing.T) {
 			report := workflowJobCommitStatusReport(run, job)
 			if report.State != tt.state || report.Description != tt.description {
 				t.Fatalf("report = %#v, want state %q and description %q", report, tt.state, tt.description)
+			}
+		})
+	}
+}
+
+func TestWorkflowJobCommitStatusReportIncludesDuration(t *testing.T) {
+	start := metav1.NewTime(time.Date(2026, time.September, 7, 12, 0, 0, 0, time.UTC))
+	for _, test := range []struct {
+		name        string
+		result      actionsv1alpha1.WorkflowJobResult
+		reason      string
+		duration    time.Duration
+		state       string
+		description string
+	}{
+		{name: "success seconds", result: actionsv1alpha1.WorkflowJobResultSuccess, duration: 22 * time.Second, state: "success", description: "Successful in 22s"},
+		{name: "success minutes", result: actionsv1alpha1.WorkflowJobResultSuccess, duration: 3*time.Minute + 2*time.Second, state: "success", description: "Successful in 3m 2s"},
+		{name: "success hours", result: actionsv1alpha1.WorkflowJobResultSuccess, duration: time.Hour + 2*time.Minute + 3*time.Second, state: "success", description: "Successful in 1h 2m 3s"},
+		{name: "whole minute", result: actionsv1alpha1.WorkflowJobResultSuccess, duration: time.Minute, state: "success", description: "Successful in 1m"},
+		{name: "zero duration", result: actionsv1alpha1.WorkflowJobResultSuccess, state: "success", description: "Successful in 0s"},
+		{name: "fractional seconds", result: actionsv1alpha1.WorkflowJobResultSuccess, duration: 22900 * time.Millisecond, state: "success", description: "Successful in 22s"},
+		{name: "failure", result: actionsv1alpha1.WorkflowJobResultFailure, duration: 8*time.Minute + 23*time.Second, state: "failure", description: "Failing after 8m 23s"},
+		{name: "timeout", result: actionsv1alpha1.WorkflowJobResultFailure, reason: "JobTimedOut", duration: 6 * time.Hour, state: "error", description: "Timed out after 6h"},
+		{name: "cancelled", result: actionsv1alpha1.WorkflowJobResultCancelled, duration: 22 * time.Second, state: "error", description: "Cancelled after 22s"},
+		{name: "condition success", reason: "JobSucceeded", duration: 22 * time.Second, state: "success", description: "Successful in 22s"},
+		{name: "condition cancellation", reason: "JobCancelled", duration: 22 * time.Second, state: "error", description: "Cancelled after 22s"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			completion := metav1.NewTime(start.Add(test.duration))
+			conditionStatus := metav1.ConditionFalse
+			if test.state == "success" {
+				conditionStatus = metav1.ConditionTrue
+			}
+			job := &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{
+				Result: test.result, StartTime: &start, CompletionTime: &completion,
+				Conditions: []metav1.Condition{{
+					Type: actionsv1alpha1.WorkflowJobConditionSucceeded, Status: conditionStatus,
+					Reason: test.reason, Message: "A controller diagnostic",
+				}},
+			}}
+			run := &actionsv1alpha1.WorkflowRun{}
+			for attempt := int32(1); attempt <= 2; attempt++ {
+				if attempt > 1 {
+					run.Spec.Rerun = &actionsv1alpha1.WorkflowRunRerun{Attempt: attempt}
+				}
+				report := workflowJobCommitStatusReport(run, job)
+				if report.State != test.state || report.Description != test.description {
+					t.Fatalf("attempt %d report = %#v, want state %q and description %q", attempt, report, test.state, test.description)
+				}
+			}
+		})
+	}
+}
+
+func TestWorkflowJobCommitStatusReportWithoutExecutionDuration(t *testing.T) {
+	start := metav1.NewTime(time.Date(2026, time.September, 7, 12, 0, 0, 0, time.UTC))
+	completion := metav1.NewTime(start.Add(22 * time.Second))
+	for _, test := range []struct {
+		name       string
+		start      *metav1.Time
+		completion *metav1.Time
+	}{
+		{name: "missing start", completion: &completion},
+		{name: "missing completion", start: &start},
+		{name: "completion precedes start", start: &completion, completion: &start},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			job := &actionsv1alpha1.WorkflowJob{Status: actionsv1alpha1.WorkflowJobStatus{
+				Result: actionsv1alpha1.WorkflowJobResultSuccess, StartTime: test.start, CompletionTime: test.completion,
+			}}
+			if report := workflowJobCommitStatusReport(&actionsv1alpha1.WorkflowRun{}, job); report.State != "success" || report.Description != "Successful" {
+				t.Fatalf("report without execution duration = %#v", report)
 			}
 		})
 	}

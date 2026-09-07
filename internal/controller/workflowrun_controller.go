@@ -68,7 +68,6 @@ const (
 	workflowRunSequenceScopeKey      = "scope"
 	workflowRunSequenceNextKey       = "next"
 	maxGitHubCompatibleNumber        = int64(9_007_199_254_740_991)
-	maxCommitStatusDescriptionRunes  = 140
 	maxCommitStatusContextRunes      = 100
 	githubStatusOwnerPrefix          = "ghso-"
 	githubStatusOwnerDataKey         = "owner.json"
@@ -1320,49 +1319,60 @@ func commitStatusReportDigest(request githubclient.CreateCommitStatusRequest) st
 }
 
 func workflowJobCommitStatusReport(run *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob) commitStatusReport {
-	report := commitStatusReport{State: "pending", Description: "The workflow job is queued"}
+	report := commitStatusReport{State: "pending", Description: "Queued"}
 	succeeded := meta.FindStatusCondition(job.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)
+	durationPrefix := "after"
 	switch workflowJobResult(job) {
 	case actionsv1alpha1.WorkflowJobResultSuccess:
 		report.State = "success"
-		report.Description = commitStatusDescription(conditionMessage(succeeded), "The workflow job succeeded")
+		report.Description = "Successful"
+		durationPrefix = "in"
 	case actionsv1alpha1.WorkflowJobResultFailure:
 		report.State = "failure"
-		report.Description = "The workflow job failed"
+		report.Description = "Failing"
 		if workflowJobTimedOut(job) {
 			report.State = "error"
-			report.Description = "The workflow job timed out"
+			report.Description = "Timed out"
 		} else if succeeded != nil && succeeded.Reason == "JobCancelled" {
 			report.State = "error"
-			report.Description = "The workflow job was cancelled"
+			report.Description = "Cancelled"
 		}
-		report.Description = commitStatusDescription(conditionMessage(succeeded), report.Description)
 	case actionsv1alpha1.WorkflowJobResultSkipped:
-		report.State = "success"
-		report.Description = "The workflow job was skipped"
+		return commitStatusReport{State: "success", Description: "Skipped"}
 	case actionsv1alpha1.WorkflowJobResultCancelled:
 		report.State = "error"
-		report.Description = commitStatusDescription(conditionMessage(succeeded), "The workflow job was cancelled")
+		report.Description = "Cancelled"
 	case "":
 		switch {
 		case !run.DeletionTimestamp.IsZero():
 			report.State = "error"
-			report.Description = "The workflow job was cancelled"
+			report.Description = "Cancelled"
 		case job.Status.StartTime != nil:
-			report.Description = "The workflow job is running"
+			report.Description = "In progress"
 		}
 	}
-	if run.Spec.Rerun != nil {
-		report.Description = commitStatusDescription(fmt.Sprintf("Attempt %d: %s", run.Spec.Rerun.Attempt, report.Description), report.Description)
+	if report.State != "pending" && job.Status.StartTime != nil && job.Status.CompletionTime != nil {
+		duration := job.Status.CompletionTime.Sub(job.Status.StartTime.Time)
+		if duration >= 0 {
+			report.Description += " " + durationPrefix + " " + githubStatusDuration(duration)
+		}
 	}
 	return report
 }
 
-func conditionMessage(condition *metav1.Condition) string {
-	if condition == nil {
-		return ""
+func githubStatusDuration(duration time.Duration) string {
+	seconds := int64(duration / time.Second)
+	parts := []string{}
+	if hours := seconds / 3600; hours > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", hours))
 	}
-	return condition.Message
+	if minutes := seconds / 60 % 60; minutes > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", minutes))
+	}
+	if seconds%60 > 0 || len(parts) == 0 {
+		parts = append(parts, fmt.Sprintf("%ds", seconds%60))
+	}
+	return strings.Join(parts, " ")
 }
 
 func workflowJobCommitStatusRequest(consoleURL string, run *actionsv1alpha1.WorkflowRun, job *actionsv1alpha1.WorkflowJob, report commitStatusReport) githubclient.CreateCommitStatusRequest {
@@ -1376,17 +1386,6 @@ func workflowJobCommitStatusRequest(consoleURL string, run *actionsv1alpha1.Work
 		Description: report.Description,
 		Context:     githubJobStatusContext(run, job),
 	}
-}
-
-func commitStatusDescription(description, fallback string) string {
-	if description == "" {
-		description = fallback
-	}
-	runes := []rune(description)
-	if len(runes) > maxCommitStatusDescriptionRunes {
-		description = string(runes[:maxCommitStatusDescriptionRunes])
-	}
-	return description
 }
 
 func workflowJobCommitStatus(job *actionsv1alpha1.WorkflowJob) *actionsv1alpha1.GitHubCommitStatus {
