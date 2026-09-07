@@ -80,6 +80,7 @@ func TestJobPlanningUsesNeeds(t *testing.T) {
 		{name: "name", job: Job{Name: "${{ needs.prepare.result }}"}, want: true},
 		{name: "runner label", job: Job{RunsOn: StringList{"${{ needs.prepare.outputs.runner }}"}}, want: true},
 		{name: "timeout", job: Job{TimeoutMinutes: JobTimeout{expression: "${{ needs.prepare.outputs.timeout }}"}}, want: true},
+		{name: "continue-on-error", job: Job{ContinueOnError: BooleanExpression{Expression: "${{ needs.prepare.result == 'success' }}"}}, want: true},
 		{name: "matrix", job: Job{Strategy: Strategy{Matrix: MatrixDefinition{Expression: "${{ needs.prepare.outputs.matrix }}"}}}, want: true},
 		{name: "job environment", job: Job{Env: map[string]any{"VALUE": "${{ needs.prepare.result }}"}}},
 		{name: "job concurrency", job: Job{Concurrency: Concurrency{Group: "${{ needs.prepare.result }}"}}},

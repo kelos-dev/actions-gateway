@@ -12,3 +12,4 @@ spec:
   runsOn:
     - ubuntu-latest
   timeoutSeconds: 21600
+  continueOnError: false

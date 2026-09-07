@@ -33,6 +33,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiEquality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -5628,6 +5629,7 @@ func TestWorkflowRunTerminalConclusions(t *testing.T) {
 	for _, test := range []struct {
 		name            string
 		cancelRequested bool
+		continueOnError bool
 		results         []actionsv1alpha1.WorkflowJobResult
 		failFast        bool
 		timedOut        bool
@@ -5635,6 +5637,10 @@ func TestWorkflowRunTerminalConclusions(t *testing.T) {
 		wantReason      string
 		wantMessage     string
 	}{
+		{name: "tolerated failure", continueOnError: true, results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultFailure, actionsv1alpha1.WorkflowJobResultSuccess, actionsv1alpha1.WorkflowJobResultSkipped}, wantStatus: metav1.ConditionTrue, wantReason: "JobsSucceeded", wantMessage: "All required WorkflowJobs succeeded"},
+		{name: "tolerance preserves timeout", continueOnError: true, timedOut: true, results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultFailure}, wantStatus: metav1.ConditionFalse, wantReason: "JobTimedOut", wantMessage: "At least one WorkflowJob timed out"},
+		{name: "tolerance preserves cancellation", continueOnError: true, results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultFailure, actionsv1alpha1.WorkflowJobResultCancelled}, wantStatus: metav1.ConditionFalse, wantReason: "JobCancelled", wantMessage: "At least one WorkflowJob was cancelled"},
+		{name: "tolerance preserves cancellation request", continueOnError: true, cancelRequested: true, results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultFailure}, wantStatus: metav1.ConditionFalse, wantReason: "JobCancelled", wantMessage: "Workflow cancellation was requested"},
 		{name: "success with skipped job", results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultSuccess, actionsv1alpha1.WorkflowJobResultSkipped}, wantStatus: metav1.ConditionTrue, wantReason: "JobsSucceeded", wantMessage: "All required WorkflowJobs succeeded"},
 		{name: "cancellation after successful completion", cancelRequested: true, results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultSuccess, actionsv1alpha1.WorkflowJobResultSuccess}, wantStatus: metav1.ConditionTrue, wantReason: "JobsSucceeded", wantMessage: "All required WorkflowJobs succeeded"},
 		{name: "failure", results: []actionsv1alpha1.WorkflowJobResult{actionsv1alpha1.WorkflowJobResultSuccess, actionsv1alpha1.WorkflowJobResultFailure}, wantStatus: metav1.ConditionFalse, wantReason: "JobFailed", wantMessage: "At least one WorkflowJob failed"},
@@ -5666,7 +5672,7 @@ func TestWorkflowRunTerminalConclusions(t *testing.T) {
 						Name: name, Namespace: run.Namespace,
 						Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)},
 					},
-					Spec:   actionsv1alpha1.WorkflowJobSpec{JobID: name},
+					Spec:   actionsv1alpha1.WorkflowJobSpec{JobID: name, ContinueOnError: test.continueOnError},
 					Status: actionsv1alpha1.WorkflowJobStatus{Result: result},
 				}
 				if test.timedOut && result == actionsv1alpha1.WorkflowJobResultFailure {
@@ -5909,7 +5915,13 @@ func TestMatrixFailFastCancelsOnlyUnfinishedSiblings(t *testing.T) {
 	disabledQueued := job("lint-queued", "lint", pointerTo(false), "", "", "")
 	cancelledFailure := job("cancelled-failed", "cancelled", pointerTo(true), "runner-5", metav1.ConditionFalse, "CancellationRequested")
 	cancelledQueued := job("cancelled-queued", "cancelled", pointerTo(true), "", "", "")
-	objects := []client.Object{run, failed, queued, active, completed, otherGroup, otherRun, disabledFailure, disabledQueued, cancelledFailure, cancelledQueued}
+	toleratedFailure := job("experimental-failed", "experimental", pointerTo(true), "runner-6", metav1.ConditionFalse, "JobFailed")
+	toleratedFailure.Spec.ContinueOnError = true
+	toleratedQueued := job("experimental-queued", "experimental", pointerTo(true), "", "", "")
+	toleratedActive := job("experimental-active", "experimental", pointerTo(true), "runner-7", metav1.ConditionUnknown, "JobRunning")
+	queued.Spec.ContinueOnError = true
+	active.Spec.ContinueOnError = true
+	objects := []client.Object{run, failed, queued, active, completed, otherGroup, otherRun, disabledFailure, disabledQueued, cancelledFailure, cancelledQueued, toleratedFailure, toleratedQueued, toleratedActive}
 	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.WorkflowJob{}).WithObjects(objects...).Build()
 
 	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
@@ -5956,9 +5968,14 @@ func TestMatrixFailFastCancelsOnlyUnfinishedSiblings(t *testing.T) {
 	if result := meta.FindStatusCondition(stored(completed.Name).Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded); result == nil || result.Status != metav1.ConditionTrue {
 		t.Fatalf("concurrently completed result = %#v", result)
 	}
-	for _, unaffected := range []*actionsv1alpha1.WorkflowJob{otherGroup, otherRun, disabledQueued, cancelledQueued} {
+	for _, unaffected := range []*actionsv1alpha1.WorkflowJob{otherGroup, otherRun, disabledQueued, cancelledQueued, toleratedQueued} {
 		if result := meta.FindStatusCondition(stored(unaffected.Name).Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded); result != nil {
 			t.Errorf("unrelated WorkflowJob %q result = %#v", unaffected.Name, result)
+		}
+	}
+	for _, unaffected := range []*actionsv1alpha1.WorkflowJob{toleratedFailure, toleratedQueued, toleratedActive} {
+		if got := stored(unaffected.Name); !apiEquality.Semantic.DeepEqual(got.Status, unaffected.Status) {
+			t.Errorf("tolerated group job %q status = %#v, want %#v", got.Name, got.Status, unaffected.Status)
 		}
 	}
 	if result := meta.FindStatusCondition(stored(failed.Name).Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded); result == nil || result.Reason != "JobFailed" {

@@ -1816,7 +1816,7 @@ func terminalWorkflowJob(workflowJob *actionsv1alpha1.WorkflowJob) bool {
 }
 
 func workflowJobFailureTriggersMatrixFailFast(workflowJob *actionsv1alpha1.WorkflowJob) bool {
-	if !matrixFailFastEnabled(workflowJob.Spec.Matrix) || workflowJobResult(workflowJob) != actionsv1alpha1.WorkflowJobResultFailure {
+	if !matrixFailFastEnabled(workflowJob.Spec.Matrix) || workflowJobEffectiveResult(workflowJob) != actionsv1alpha1.WorkflowJobResultFailure {
 		return false
 	}
 	condition := meta.FindStatusCondition(workflowJob.Status.Conditions, actionsv1alpha1.WorkflowJobConditionSucceeded)

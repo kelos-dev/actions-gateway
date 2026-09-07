@@ -18,7 +18,7 @@ const (
 	WorkflowJobResultCancelled WorkflowJobResult = "cancelled"
 )
 
-// WorkflowJobResult is the terminal result exposed to dependent workflow jobs.
+// WorkflowJobResult is a terminal job result.
 type WorkflowJobResult string
 
 // WorkflowJobSpec describes one immutable job expanded from a WorkflowRun.
@@ -76,6 +76,13 @@ type WorkflowJobSpec struct {
 	// +kubebuilder:validation:MaxLength=65536
 	// +optional
 	If string `json:"if,omitempty"`
+
+	// ContinueOnError allows a failed job to satisfy dependencies and lets the
+	// workflow succeed without triggering matrix fail-fast. The execution result
+	// remains failure. Cancellation and timeout are not tolerated.
+	// +kubebuilder:default=false
+	// +optional
+	ContinueOnError bool `json:"continueOnError,omitempty"`
 
 	// Concurrency delays Runner assignment until this job owns the evaluated
 	// group. The group expression is evaluated after Needs reaches terminal
@@ -220,7 +227,7 @@ type WorkflowJobStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// Result is the immutable terminal result exposed through the needs context.
+	// Result is the immutable terminal execution result before job tolerance.
 	// +kubebuilder:validation:Enum=success;failure;skipped;cancelled
 	// +optional
 	Result WorkflowJobResult `json:"result,omitempty"`

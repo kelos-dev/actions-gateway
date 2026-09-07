@@ -99,6 +99,13 @@ spec:
                 required:
                 - group
                 type: object
+              continueOnError:
+                default: false
+                description: |-
+                  ContinueOnError allows a failed job to satisfy dependencies and lets the
+                  workflow succeed without triggering matrix fail-fast. The execution result
+                  remains failure. Cancellation and timeout are not tolerated.
+                type: boolean
               displayName:
                 description: |-
                   DisplayName is the user-facing name of the workflow job. The controller
@@ -358,8 +365,8 @@ spec:
                 - message: output values must be no more than 4096 characters
                   rule: self.all(k, size(self[k]) <= 4096)
               result:
-                description: Result is the immutable terminal result exposed through
-                  the needs context.
+                description: Result is the immutable terminal execution result before
+                  job tolerance.
                 enum:
                 - success
                 - failure
