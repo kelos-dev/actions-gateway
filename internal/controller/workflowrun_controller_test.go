@@ -1732,7 +1732,7 @@ func TestReconcileDeferredJobConfigurationFromDependencyResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.ensureWorkflowPlan(context.Background(), run, project, planned, deferred); err != nil {
+	if err := reconciler.ensureWorkflowPlan(context.Background(), run, project, planned, deferred, definition); err != nil {
 		t.Fatal(err)
 	}
 	if err := reconciler.ensureWorkflowJobs(context.Background(), run, project, planned); err != nil {
@@ -1814,7 +1814,7 @@ func TestReconcileDeferredJobsCompletesExistingResultPlaceholder(t *testing.T) {
 				t.Fatalf("planned = %#v, deferred = %#v", planned, deferred)
 			}
 			ctx := context.Background()
-			if err := reconciler.ensureWorkflowPlan(ctx, run, project, planned, deferred); err != nil {
+			if err := reconciler.ensureWorkflowPlan(ctx, run, project, planned, deferred, definition); err != nil {
 				t.Fatal(err)
 			}
 			if err := reconciler.ensureWorkflowJobs(ctx, run, project, planned); err != nil {
@@ -1905,7 +1905,7 @@ func TestReconcileDynamicMatrixFromDependencyOutput(t *testing.T) {
 	if len(planned) != 1 || len(deferred) != 1 || deferred[0].JobID != "build" {
 		t.Fatalf("planned = %#v, deferred = %#v", planned, deferred)
 	}
-	if err := reconciler.ensureWorkflowPlan(context.Background(), run, project, planned, deferred); err != nil {
+	if err := reconciler.ensureWorkflowPlan(context.Background(), run, project, planned, deferred, definition); err != nil {
 		t.Fatal(err)
 	}
 	variables["ENVIRONMENT"] = "staging"
@@ -2078,7 +2078,7 @@ func TestReconcileDeferredJobsRefreshesJobsBetweenExpansions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.ensureWorkflowPlan(context.Background(), run, project, planned, deferred); err != nil {
+	if err := reconciler.ensureWorkflowPlan(context.Background(), run, project, planned, deferred, definition); err != nil {
 		t.Fatal(err)
 	}
 	if err := reconciler.ensureWorkflowJobs(context.Background(), run, project, planned); err != nil {
@@ -2144,7 +2144,7 @@ func TestReconcileDynamicMatrixFailsInvalidOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.ensureWorkflowPlan(context.Background(), run, project, nil, deferred); err != nil {
+	if err := reconciler.ensureWorkflowPlan(context.Background(), run, project, nil, deferred, definition); err != nil {
 		t.Fatal(err)
 	}
 	jobs := &actionsv1alpha1.WorkflowJobList{}

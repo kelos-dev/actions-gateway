@@ -180,3 +180,44 @@ func needsSelectedJob(needs []string, selectedLogicalIDs map[string]struct{}) bo
 	}
 	return false
 }
+
+// JobHistory filters attempts in newest-first order. Selected jobs cannot fall
+// back to older executions, and complete logical jobs replace older expansions.
+type JobHistory struct {
+	jobIDs     map[string]struct{}
+	logicalIDs map[string]struct{}
+}
+
+// Add returns the jobs from this attempt that remain effective in the lineage.
+func (h *JobHistory) Add(run *actionsv1alpha1.WorkflowRun, jobs []actionsv1alpha1.WorkflowJob) []actionsv1alpha1.WorkflowJob {
+	if h.jobIDs == nil {
+		h.jobIDs = make(map[string]struct{})
+		h.logicalIDs = make(map[string]struct{})
+	}
+	retained := make([]actionsv1alpha1.WorkflowJob, 0, len(jobs))
+	groups := make(map[string][]actionsv1alpha1.WorkflowJob)
+	for _, job := range jobs {
+		logicalID := logicalJobID(&job)
+		groups[logicalID] = append(groups[logicalID], job)
+		_, replacedJob := h.jobIDs[job.Spec.JobID]
+		_, replacedLogical := h.logicalIDs[logicalID]
+		_, selectedLogical := h.jobIDs[logicalID]
+		if !replacedJob && !replacedLogical && !selectedLogical {
+			retained = append(retained, job)
+		}
+	}
+	for _, job := range jobs {
+		h.jobIDs[job.Spec.JobID] = struct{}{}
+	}
+	for id, group := range groups {
+		if group[0].Spec.Matrix == nil || len(group) == int(group[0].Spec.Matrix.JobTotal) {
+			h.logicalIDs[id] = struct{}{}
+		}
+	}
+	if run.Spec.Rerun != nil {
+		for _, id := range run.Spec.Rerun.JobIDs {
+			h.jobIDs[id] = struct{}{}
+		}
+	}
+	return retained
+}

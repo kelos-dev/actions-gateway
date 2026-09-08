@@ -1768,3 +1768,35 @@ func responseCookie(t *testing.T, response *http.Response, name string) *http.Co
 	t.Fatalf("response has no %s cookie", name)
 	return nil
 }
+
+func TestConsoleSelectiveRerunReplacesDeferredPlaceholder(t *testing.T) {
+	handler := newTestHandler(t, false)
+	root := &actionsv1alpha1.WorkflowRun{}
+	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "ci"}, root); err != nil {
+		t.Fatal(err)
+	}
+	rerun := workflowrun.NewRerun(root, root, 2, []string{"build"})
+	rerun.UID = "rerun-uid"
+	if err := handler.client.Create(context.Background(), rerun); err != nil {
+		t.Fatal(err)
+	}
+	job := &actionsv1alpha1.WorkflowJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "build-matrix-1", Namespace: root.Namespace, Labels: map[string]string{actionsv1alpha1.LabelWorkflowRunUID: string(rerun.UID)}},
+		Spec:       actionsv1alpha1.WorkflowJobSpec{WorkflowRunRef: corev1.LocalObjectReference{Name: rerun.Name}, JobID: "build-matrix-1", Matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: "build", JobTotal: 1, Values: map[string]string{"project": "one"}}},
+	}
+	if err := handler.client.Create(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	third := workflowrun.NewRerun(root, rerun, 3, []string{"build-matrix-1"})
+	third.UID = "third-uid"
+	if err := handler.client.Create(context.Background(), third); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := handler.effectiveWorkflowJobs(context.Background(), third)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("pending matrix retry inherited superseded jobs: %#v", jobs)
+	}
+}

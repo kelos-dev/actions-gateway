@@ -1495,7 +1495,7 @@ func (h *Handler) loadRunPageData(ctx context.Context, run *actionsv1alpha1.Work
 
 func (h *Handler) effectiveWorkflowJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun) ([]effectiveWorkflowJob, error) {
 	effectiveByID := make(map[string]effectiveWorkflowJob)
-	replacedIDs := make(map[string]struct{})
+	history := &workflowrun.JobHistory{}
 	visited := map[types.UID]struct{}{run.UID: {}}
 	current := run
 	var rootRef actionsv1alpha1.WorkflowRunReference
@@ -1508,22 +1508,12 @@ func (h *Handler) effectiveWorkflowJobs(ctx context.Context, run *actionsv1alpha
 		if err := h.client.List(ctx, jobs, client.InNamespace(current.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(current.UID)}); err != nil {
 			return nil, fmt.Errorf("load WorkflowJobs for WorkflowRun %q: %w", current.Name, err)
 		}
-		for index := range jobs.Items {
-			job := jobs.Items[index]
-			if _, replaced := replacedIDs[job.Spec.JobID]; replaced {
-				continue
-			}
-			if _, found := effectiveByID[job.Spec.JobID]; !found {
-				effectiveByID[job.Spec.JobID] = effectiveWorkflowJob{run: current, job: job}
-			}
+		for _, job := range history.Add(current, jobs.Items) {
+			effectiveByID[job.Spec.JobID] = effectiveWorkflowJob{run: current, job: job}
 		}
 
 		if current.Spec.Rerun == nil || len(current.Spec.Rerun.JobIDs) == 0 {
 			break
-		}
-		// Selected IDs must not fall back to an older execution while their current WorkflowJobs are being created.
-		for _, id := range current.Spec.Rerun.JobIDs {
-			replacedIDs[id] = struct{}{}
 		}
 
 		ref := current.Spec.Rerun.PreviousRunRef

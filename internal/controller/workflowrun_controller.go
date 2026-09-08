@@ -26,6 +26,7 @@ import (
 	"github.com/kelos-dev/open-actions/internal/runner"
 	"github.com/kelos-dev/open-actions/internal/workflow"
 	"github.com/kelos-dev/open-actions/internal/workflowcontext"
+	"github.com/kelos-dev/open-actions/internal/workflowrun"
 	"github.com/kelos-dev/open-actions/internal/workflowsnapshot"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -568,28 +569,24 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	if err != nil {
 		return r.planningEvaluationFailed(ctx, run, err)
 	}
-	if len(deferredJobs) > 0 && run.Spec.Rerun != nil && len(run.Spec.Rerun.JobIDs) > 0 {
-		return r.planningFailed(ctx, run, "RerunInvalid", fmt.Errorf("WorkflowRun %q does not support selective reruns with deferred job planning", run.Name), planningFailureTerminal)
+	plannedJobs, deferredJobs, err = r.selectRerunWorkflowPlan(ctx, run, plannedJobs, deferredJobs)
+	if err == nil && run.Spec.Rerun != nil && len(run.Spec.Rerun.JobIDs) > 0 {
+		graph := deferredWorkflowJobGraph(plannedWorkflowJobsForDependencyGraph(plannedJobs), deferredJobs)
+		_, err = r.rerunDependencyWorkflowJobs(ctx, run, graph)
 	}
-	plannedJobs, err = selectRerunWorkflowJobs(run, plannedJobs)
 	if err != nil {
-		return r.planningFailed(ctx, run, "RerunInvalid", err, planningFailureTerminal)
-	}
-	if run.Spec.Rerun != nil && len(run.Spec.Rerun.JobIDs) > 0 {
-		if _, err := r.rerunDependencyWorkflowJobs(ctx, run, plannedWorkflowJobsForDependencyGraph(plannedJobs)); err != nil {
-			disposition := planningFailureRetry
-			terminal := &terminalPlanningError{}
-			if errors.As(err, &terminal) {
-				disposition = planningFailureTerminal
-			}
-			return r.planningFailed(ctx, run, "RerunInvalid", err, disposition)
+		disposition := planningFailureRetry
+		terminal := &terminalPlanningError{}
+		if errors.As(err, &terminal) {
+			disposition = planningFailureTerminal
 		}
+		return r.planningFailed(ctx, run, "RerunInvalid", err, disposition)
 	}
 	jobCount := int32(len(plannedJobs) + len(deferredJobs))
 	run.Status.WorkflowName = definition.Name
 	run.Status.Jobs = &actionsv1alpha1.WorkflowRunJobStatus{Total: jobCount}
 	if len(deferredJobs) > 0 {
-		if err := r.ensureWorkflowPlan(ctx, run, project, plannedJobs, deferredJobs); err != nil {
+		if err := r.ensureWorkflowPlan(ctx, run, project, plannedJobs, deferredJobs, definition); err != nil {
 			return r.planningFailed(ctx, run, "ChildCreationFailed", err, childCreationFailureDisposition(err))
 		}
 	}
@@ -1463,6 +1460,7 @@ type deferredJobPlan struct {
 	Variables    map[string]any    `json:"variables,omitempty"`
 	Job          workflow.Job      `json:"job"`
 	InputValues  map[string]any    `json:"inputValues,omitempty"`
+	RerunJobs    []rerunMatrixJob  `json:"rerunJobs,omitempty"`
 }
 
 type workflowPlanManifest struct {
@@ -1522,12 +1520,26 @@ func (r *WorkflowRunReconciler) rerunDependencyWorkflowJobs(ctx context.Context,
 		return nil, nil
 	}
 
+	var dependencies []actionsv1alpha1.WorkflowJob
+	err := r.resolveRerunHistory(ctx, run, currentJobs, func(historical map[string]actionsv1alpha1.WorkflowJob) error {
+		var err error
+		dependencies, err = resolvedRerunDependencyWorkflowJobs(currentJobs, historical)
+		return err
+	})
+	return dependencies, err
+}
+
+func (r *WorkflowRunReconciler) resolveRerunHistory(ctx context.Context, run *actionsv1alpha1.WorkflowRun, currentJobs []actionsv1alpha1.WorkflowJob, resolve func(map[string]actionsv1alpha1.WorkflowJob) error) error {
 	historicalByID := make(map[string]actionsv1alpha1.WorkflowJob)
-	dependencies, dependencyErr := resolvedRerunDependencyWorkflowJobs(currentJobs, historicalByID)
-	if dependencyErr == nil {
-		return dependencies, nil
+	resolutionErr := resolve(historicalByID)
+	if resolutionErr == nil {
+		return nil
 	}
 
+	history := &workflowrun.JobHistory{}
+	if currentJobs != nil {
+		history.Add(run, currentJobs)
+	}
 	ref := run.Spec.Rerun.PreviousRunRef
 	visited := make(map[types.UID]struct{})
 	for {
@@ -1535,42 +1547,39 @@ func (r *WorkflowRunReconciler) rerunDependencyWorkflowJobs(ctx context.Context,
 		key := client.ObjectKey{Namespace: run.Namespace, Name: ref.Name}
 		if err := r.APIReader.Get(ctx, key, previous); err != nil {
 			if apierrors.IsNotFound(err) {
-				return nil, &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q cannot resolve rerun dependencies because WorkflowRun %q is unavailable: %w", run.Name, ref.Name, dependencyErr)}
+				return &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q cannot resolve rerun dependencies because WorkflowRun %q is unavailable: %w", run.Name, ref.Name, resolutionErr)}
 			}
-			return nil, fmt.Errorf("get dependency WorkflowRun %q for WorkflowRun %q: %w", ref.Name, run.Name, err)
+			return fmt.Errorf("get dependency WorkflowRun %q for WorkflowRun %q: %w", ref.Name, run.Name, err)
 		}
 		if previous.UID != ref.UID {
-			return nil, &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q cannot resolve rerun dependencies because WorkflowRun %q has a different UID", run.Name, previous.Name)}
+			return &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q cannot resolve rerun dependencies because WorkflowRun %q has a different UID", run.Name, previous.Name)}
 		}
 		if _, found := visited[previous.UID]; found {
-			return nil, &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q rerun lineage contains a cycle at WorkflowRun %q", run.Name, previous.Name)}
+			return &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q rerun lineage contains a cycle at WorkflowRun %q", run.Name, previous.Name)}
 		}
 		visited[previous.UID] = struct{}{}
 
 		jobs := &actionsv1alpha1.WorkflowJobList{}
 		if err := r.APIReader.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(previous.UID)}); err != nil {
-			return nil, fmt.Errorf("list dependency WorkflowJobs for WorkflowRun %q: %w", previous.Name, err)
+			return fmt.Errorf("list dependency WorkflowJobs for WorkflowRun %q: %w", previous.Name, err)
 		}
-		for index := range jobs.Items {
-			job := jobs.Items[index]
-			if _, found := historicalByID[job.Spec.JobID]; !found {
-				historicalByID[job.Spec.JobID] = job
-			}
+		for _, job := range history.Add(previous, jobs.Items) {
+			historicalByID[job.Spec.JobID] = job
 		}
-		dependencies, dependencyErr = resolvedRerunDependencyWorkflowJobs(currentJobs, historicalByID)
-		if dependencyErr == nil {
-			return dependencies, nil
+		resolutionErr = resolve(historicalByID)
+		if resolutionErr == nil {
+			return nil
 		}
 		if previous.Spec.Rerun == nil {
 			break
 		}
 		if previous.Spec.Rerun.OriginalRunRef != run.Spec.Rerun.OriginalRunRef {
-			return nil, &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q dependency lineage does not match WorkflowRun %q", previous.Name, run.Name)}
+			return &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q dependency lineage does not match WorkflowRun %q", previous.Name, run.Name)}
 		}
 		ref = previous.Spec.Rerun.PreviousRunRef
 	}
 
-	return nil, &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q cannot resolve rerun dependencies: %w", run.Name, dependencyErr)}
+	return &terminalPlanningError{cause: fmt.Errorf("WorkflowRun %q cannot resolve rerun dependencies: %w", run.Name, resolutionErr)}
 }
 
 func resolvedRerunDependencyWorkflowJobs(currentJobs []actionsv1alpha1.WorkflowJob, historicalByID map[string]actionsv1alpha1.WorkflowJob) ([]actionsv1alpha1.WorkflowJob, error) {
@@ -1797,7 +1806,7 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 		if len(combinations) == 0 {
 			combinations = []map[string]any{nil}
 		}
-		expanded, err := r.expandPlannedWorkflowJob(run, definition.Name, id, workflowEnv, definitionJob, inputValues, expressionContext, combinations, sourceIDs, plannedIDs, nil)
+		expanded, err := r.expandPlannedWorkflowJob(run, definition.Name, id, workflowEnv, definitionJob, inputValues, expressionContext, combinations, sourceIDs, plannedIDs, nil, nil)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1809,7 +1818,7 @@ func (r *WorkflowRunReconciler) planWorkflowJobs(run *actionsv1alpha1.WorkflowRu
 	return plannedJobs, deferredJobs, nil
 }
 
-func (r *WorkflowRunReconciler) expandPlannedWorkflowJob(run *actionsv1alpha1.WorkflowRun, workflowName, id string, workflowEnv map[string]string, definitionJob workflow.Job, inputValues map[string]any, expressionContext workflowexpression.Context, combinations []map[string]any, sourceIDs, plannedIDs map[string]struct{}, continueOnErrorByID map[string]bool) ([]plannedWorkflowJob, error) {
+func (r *WorkflowRunReconciler) expandPlannedWorkflowJob(run *actionsv1alpha1.WorkflowRun, workflowName, id string, workflowEnv map[string]string, definitionJob workflow.Job, inputValues map[string]any, expressionContext workflowexpression.Context, combinations []map[string]any, sourceIDs, plannedIDs map[string]struct{}, continueOnErrorByID map[string]bool, rerunJobs []rerunMatrixJob) ([]plannedWorkflowJob, error) {
 	plannedJobs := make([]plannedWorkflowJob, 0, len(combinations))
 	for index, matrix := range combinations {
 		expandedID := id
@@ -1824,6 +1833,10 @@ func (r *WorkflowRunReconciler) expandPlannedWorkflowJob(run *actionsv1alpha1.Wo
 				MaxParallel:  definitionJob.Strategy.MaxParallel,
 				FailFast:     pointerTo(definitionJob.Strategy.FailFast),
 			}
+		}
+		if len(rerunJobs) > 0 {
+			expandedID = rerunJobs[index].ID
+			matrixSpec = rerunJobs[index].Matrix.DeepCopy()
 		}
 		if _, found := plannedIDs[expandedID]; found {
 			return nil, fmt.Errorf("expanded job ID %q is not unique", expandedID)
@@ -2514,25 +2527,21 @@ func (r *WorkflowRunReconciler) ensureWorkflowFileSnapshot(ctx context.Context, 
 	return nil
 }
 
-func (r *WorkflowRunReconciler) ensureWorkflowPlan(ctx context.Context, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, plannedJobs []plannedWorkflowJob, deferredJobs []deferredJobPlan) error {
+func (r *WorkflowRunReconciler) ensureWorkflowPlan(ctx context.Context, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project, plannedJobs []plannedWorkflowJob, deferredJobs []deferredJobPlan, definition *workflow.Definition) error {
 	manifest := workflowPlanManifest{
 		JobIDs:       make([]string, 0, len(plannedJobs)),
 		SourceIDs:    make([]string, 0, len(plannedJobs)+len(deferredJobs)),
 		DeferredJobs: make(map[string]string, len(deferredJobs)),
 	}
-	sourceIDs := map[string]struct{}{}
+	for id := range definition.Jobs {
+		manifest.SourceIDs = append(manifest.SourceIDs, id)
+	}
 	for _, job := range plannedJobs {
 		manifest.JobIDs = append(manifest.JobIDs, job.id)
-		sourceID := job.id
-		if job.matrix != nil {
-			sourceID = job.matrix.LogicalJobID
-		}
-		sourceIDs[sourceID] = struct{}{}
 	}
 	sort.Strings(manifest.JobIDs)
 	for index := range deferredJobs {
 		plan := &deferredJobs[index]
-		sourceIDs[plan.JobID] = struct{}{}
 		name := deferredJobPlanConfigMapName(run.Name, plan.JobID)
 		manifest.DeferredJobs[plan.JobID] = name
 		data, err := json.Marshal(plan)
@@ -2561,9 +2570,6 @@ func (r *WorkflowRunReconciler) ensureWorkflowPlan(ctx context.Context, run *act
 		if err := r.ensureWorkflowOwnedConfigMap(ctx, run, configMap, deferredJobPlanKey); err != nil {
 			return err
 		}
-	}
-	for id := range sourceIDs {
-		manifest.SourceIDs = append(manifest.SourceIDs, id)
 	}
 	sort.Strings(manifest.SourceIDs)
 	data, err := json.Marshal(manifest)
@@ -2867,10 +2873,11 @@ func runnerReviewEvent(event *actionsv1alpha1.GitHubReviewEvent) *runner.ReviewE
 }
 
 type workflowPlanState struct {
-	active   bool
-	changed  bool
-	pending  map[string]struct{}
-	expected map[string]struct{}
+	dependencies []actionsv1alpha1.WorkflowJob
+	active       bool
+	changed      bool
+	pending      map[string]struct{}
+	expected     map[string]struct{}
 }
 
 func (r *WorkflowRunReconciler) reconcileDeferredJobs(ctx context.Context, run *actionsv1alpha1.WorkflowRun, jobs *actionsv1alpha1.WorkflowJobList) (workflowPlanState, error) {
@@ -2928,6 +2935,8 @@ func (r *WorkflowRunReconciler) reconcileDeferredJobs(ctx context.Context, run *
 		deferredJobIDs = append(deferredJobIDs, id)
 	}
 	sort.Strings(deferredJobIDs)
+	plans := make([]deferredJobPlan, 0, len(deferredJobIDs))
+	planConfigMaps := make(map[string]*corev1.ConfigMap, len(deferredJobIDs))
 	for _, id := range deferredJobIDs {
 		planConfigMap := &corev1.ConfigMap{}
 		planKey := client.ObjectKey{Namespace: run.Namespace, Name: manifest.DeferredJobs[id]}
@@ -2949,18 +2958,59 @@ func (r *WorkflowRunReconciler) reconcileDeferredJobs(ctx context.Context, run *
 		if plan.JobID != id {
 			return state, &terminalPlanningError{cause: fmt.Errorf("deferred job plan ConfigMap %q identifies job %q, want %q", planConfigMap.Name, plan.JobID, id)}
 		}
+		plans = append(plans, plan)
+		planConfigMaps[id] = planConfigMap
+	}
+	graph := deferredWorkflowJobGraph(jobs.Items, plans)
+	dependencies, err := r.rerunDependencyWorkflowJobs(ctx, run, graph)
+	if err != nil {
+		return state, err
+	}
+	state.dependencies = dependencies
+	dependencyGroups := make(map[string][]*actionsv1alpha1.WorkflowJob)
+	for _, job := range append(graph, dependencies...) {
+		logicalID := job.Spec.JobID
+		if job.Spec.Matrix != nil {
+			logicalID = job.Spec.Matrix.LogicalJobID
+		}
+		dependencyGroups[logicalID] = append(dependencyGroups[logicalID], &job)
+	}
+	for _, plan := range plans {
+		id := plan.JobID
+		planConfigMap := planConfigMaps[id]
 		if resultJob := jobsByID[id]; resultJob != nil && workflowJobTerminal(resultJob) {
 			state.expected[id] = struct{}{}
 			continue
 		}
-		resultPlaceholder, err := r.deferredJobResultPlaceholder(run, planConfigMap, plan)
+		group := jobsByLogicalID[id]
+		if len(group) > 0 && group[0].Spec.Matrix != nil {
+			expected := int(group[0].Spec.Matrix.JobTotal)
+			if len(plan.RerunJobs) > 0 {
+				expected = len(plan.RerunJobs)
+			}
+			completed := len(group) == expected
+			for _, job := range group {
+				completed = completed && workflowJobTerminal(job)
+			}
+			if completed {
+				for _, job := range group {
+					state.expected[job.Spec.JobID] = struct{}{}
+				}
+				continue
+			}
+		}
+		resultPlaceholders, err := r.deferredJobResultPlaceholders(run, planConfigMap, plan)
 		if err != nil {
 			return state, &terminalPlanningError{cause: err}
 		}
 		jobPlanned := false
 		continueOnErrorByID := map[string]bool{}
 		for _, job := range jobsByLogicalID[id] {
-			if !deferredJobResultPlaceholderMatches(job, resultPlaceholder, run) {
+			placeholder := false
+			for _, desired := range resultPlaceholders {
+				placeholder = placeholder || deferredJobResultPlaceholderMatches(job, desired, run)
+			}
+			if !placeholder {
 				jobPlanned = true
 				// Expansion recovers missing children; existing children retain
 				// their immutable tolerance decisions.
@@ -2970,7 +3020,7 @@ func (r *WorkflowRunReconciler) reconcileDeferredJobs(ctx context.Context, run *
 
 		dependenciesReady := true
 		for _, dependency := range plan.Job.Needs {
-			needed := jobsByLogicalID[dependency]
+			needed := dependencyGroups[dependency]
 			if len(needed) == 0 {
 				dependenciesReady = false
 				break
@@ -2989,12 +3039,12 @@ func (r *WorkflowRunReconciler) reconcileDeferredJobs(ctx context.Context, run *
 
 		logicalJob := &actionsv1alpha1.WorkflowJob{Spec: actionsv1alpha1.WorkflowJobSpec{JobID: id, Needs: append([]string(nil), plan.Job.Needs...), If: plan.Job.If}}
 		expressionContext := r.jobExpressionContext(run, plan.WorkflowName, plan.InputValues, plan.Variables, plan.EventPayload)
-		expressionContext.Values["needs"] = workflowNeedsContext(logicalJob, jobsByLogicalID).ExpressionValues()
-		expressionContext.Status = workflowJobAncestorStatus(logicalJob, jobsByLogicalID, run.Spec.CancelRequested)
+		expressionContext.Values["needs"] = workflowNeedsContext(logicalJob, dependencyGroups).ExpressionValues()
+		expressionContext.Status = workflowJobAncestorStatus(logicalJob, dependencyGroups, run.Spec.CancelRequested)
 		if !jobPlanned {
 			runnable, err := workflow.EvaluateJobCondition(id, plan.Job.If, expressionContext)
 			if err != nil {
-				changed, resultErr := r.completeDeferredJobPlanning(ctx, run, planConfigMap, plan, jobsByID[id], actionsv1alpha1.WorkflowJobResultFailure, "ConditionEvaluationFailed", err.Error())
+				changed, resultErr := r.completeDeferredJobPlanning(ctx, run, planConfigMap, plan, jobsByID, actionsv1alpha1.WorkflowJobResultFailure, "ConditionEvaluationFailed", err.Error())
 				state.changed = state.changed || changed
 				state.expected[id] = struct{}{}
 				return state, resultErr
@@ -3008,20 +3058,27 @@ func (r *WorkflowRunReconciler) reconcileDeferredJobs(ctx context.Context, run *
 					reason = "CancellationRequested"
 					message = "The workflow job was cancelled before deferred planning"
 				}
-				changed, resultErr := r.completeDeferredJobPlanning(ctx, run, planConfigMap, plan, jobsByID[id], result, reason, message)
+				changed, resultErr := r.completeDeferredJobPlanning(ctx, run, planConfigMap, plan, jobsByID, result, reason, message)
 				state.changed = state.changed || changed
 				state.expected[id] = struct{}{}
 				return state, resultErr
 			}
 		}
 
-		combinations, err := workflow.EvaluateMatrix(id, plan.Job.Strategy, expressionContext)
+		var combinations []map[string]any
+		if len(plan.RerunJobs) > 0 {
+			for _, selected := range plan.RerunJobs {
+				combinations = append(combinations, selected.Values)
+			}
+		} else {
+			combinations, err = workflow.EvaluateMatrix(id, plan.Job.Strategy, expressionContext)
+		}
 		if err != nil {
 			var unavailable *projectValuesUnavailableError
 			if errors.As(err, &unavailable) {
 				return state, err
 			}
-			changed, resultErr := r.completeDeferredJobPlanning(ctx, run, planConfigMap, plan, jobsByID[id], actionsv1alpha1.WorkflowJobResultFailure, "JobPlanningFailed", err.Error())
+			changed, resultErr := r.completeDeferredJobPlanning(ctx, run, planConfigMap, plan, jobsByID, actionsv1alpha1.WorkflowJobResultFailure, "JobPlanningFailed", err.Error())
 			state.changed = state.changed || changed
 			state.expected[id] = struct{}{}
 			return state, resultErr
@@ -3031,7 +3088,7 @@ func (r *WorkflowRunReconciler) reconcileDeferredJobs(ctx context.Context, run *
 		}
 		if projectedWorkflowJobCount(len(jobs.Items), jobsByLogicalID, deferredJobIDs, id, len(combinations)) > workflow.MaxJobs {
 			message := fmt.Sprintf("workflow expands to more than %d jobs", workflow.MaxJobs)
-			changed, resultErr := r.completeDeferredJobPlanning(ctx, run, planConfigMap, plan, jobsByID[id], actionsv1alpha1.WorkflowJobResultFailure, "JobPlanningFailed", message)
+			changed, resultErr := r.completeDeferredJobPlanning(ctx, run, planConfigMap, plan, jobsByID, actionsv1alpha1.WorkflowJobResultFailure, "JobPlanningFailed", message)
 			state.changed = state.changed || changed
 			state.expected[id] = struct{}{}
 			return state, resultErr
@@ -3046,13 +3103,13 @@ func (r *WorkflowRunReconciler) reconcileDeferredJobs(ctx context.Context, run *
 		for expectedID := range state.expected {
 			plannedIDs[expectedID] = struct{}{}
 		}
-		expanded, err := r.expandPlannedWorkflowJob(run, plan.WorkflowName, id, plan.WorkflowEnv, plan.Job, plan.InputValues, expressionContext, combinations, sourceIDs, plannedIDs, continueOnErrorByID)
+		expanded, err := r.expandPlannedWorkflowJob(run, plan.WorkflowName, id, plan.WorkflowEnv, plan.Job, plan.InputValues, expressionContext, combinations, sourceIDs, plannedIDs, continueOnErrorByID, plan.RerunJobs)
 		if err != nil {
 			var unavailable *projectValuesUnavailableError
 			if errors.As(err, &unavailable) {
 				return state, err
 			}
-			changed, resultErr := r.completeDeferredJobPlanning(ctx, run, planConfigMap, plan, jobsByID[id], actionsv1alpha1.WorkflowJobResultFailure, "JobPlanningFailed", err.Error())
+			changed, resultErr := r.completeDeferredJobPlanning(ctx, run, planConfigMap, plan, jobsByID, actionsv1alpha1.WorkflowJobResultFailure, "JobPlanningFailed", err.Error())
 			state.changed = state.changed || changed
 			state.expected[id] = struct{}{}
 			return state, resultErr
@@ -3087,16 +3144,53 @@ func projectedWorkflowJobCount(existingJobs int, jobsByLogicalID map[string][]*a
 	return result
 }
 
-func (r *WorkflowRunReconciler) completeDeferredJobPlanning(ctx context.Context, run *actionsv1alpha1.WorkflowRun, planConfigMap *corev1.ConfigMap, plan deferredJobPlan, existing *actionsv1alpha1.WorkflowJob, result actionsv1alpha1.WorkflowJobResult, reason, message string) (bool, error) {
-	desired, err := r.deferredJobResultPlaceholder(run, planConfigMap, plan)
+func (r *WorkflowRunReconciler) completeDeferredJobPlanning(ctx context.Context, run *actionsv1alpha1.WorkflowRun, planConfigMap *corev1.ConfigMap, plan deferredJobPlan, existing map[string]*actionsv1alpha1.WorkflowJob, result actionsv1alpha1.WorkflowJobResult, reason, message string) (bool, error) {
+	placeholders, err := r.deferredJobResultPlaceholders(run, planConfigMap, plan)
 	if err != nil {
 		return false, &terminalPlanningError{cause: err}
 	}
+	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{
+		Name: planConfigMap.Annotations[actionsv1alpha1.AnnotationProjectName],
+		UID:  types.UID(planConfigMap.Labels[actionsv1alpha1.LabelProjectUID]),
+	}}
+	changed := false
+	for index, desired := range placeholders {
+		if len(plan.RerunJobs) > 0 {
+			selected := plan.RerunJobs[index]
+			jobPlan, err := r.jobPlan(run, plan.WorkflowName, plan.JobID, plan.WorkflowEnv, plan.Job, selected.Values, plan.InputValues, r.effectiveJobTimeoutSeconds(workflow.DefaultJobTimeoutMinutes))
+			if err != nil {
+				return changed, err
+			}
+			jobPlan.Strategy = workflowJobStrategyContext(selected.Matrix)
+			data, err := json.Marshal(jobPlan)
+			if err != nil {
+				return changed, err
+			}
+			// Keep the matrix snapshot available if planning itself fails and this child is retried.
+			jobs := []plannedWorkflowJob{{
+				id: desired.Spec.JobID, displayName: desired.Spec.DisplayName,
+				runsOn: desired.Spec.RunsOn, needs: desired.Spec.Needs,
+				condition: desired.Spec.If, matrix: desired.Spec.Matrix, plan: string(data),
+			}}
+			if err := r.ensureWorkflowJobs(ctx, run, project, jobs); err != nil {
+				return changed, err
+			}
+		}
+		updated, err := r.completeDeferredJobResult(ctx, run, desired, existing[desired.Spec.JobID], result, reason, message)
+		changed = changed || updated
+		if err != nil {
+			return changed, err
+		}
+	}
+	return changed, nil
+}
+
+func (r *WorkflowRunReconciler) completeDeferredJobResult(ctx context.Context, run *actionsv1alpha1.WorkflowRun, desired, existing *actionsv1alpha1.WorkflowJob, result actionsv1alpha1.WorkflowJobResult, reason, message string) (bool, error) {
 	job := desired
 	created := false
 	if existing != nil {
 		if !deferredJobResultPlaceholderMatches(existing, desired, run) {
-			return false, &terminalPlanningError{cause: fmt.Errorf("WorkflowJob %q does not match deferred job %q in WorkflowRun %q", existing.Name, plan.JobID, run.Name)}
+			return false, &terminalPlanningError{cause: fmt.Errorf("WorkflowJob %q does not match deferred job %q in WorkflowRun %q", existing.Name, desired.Spec.JobID, run.Name)}
 		}
 		job = existing
 	} else if err := r.Create(ctx, desired); err != nil {
@@ -3104,11 +3198,11 @@ func (r *WorkflowRunReconciler) completeDeferredJobPlanning(ctx context.Context,
 			return false, err
 		}
 		job = &actionsv1alpha1.WorkflowJob{}
-		if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: workflowJobName(run.Name, plan.JobID)}, job); err != nil {
+		if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: desired.Name}, job); err != nil {
 			return false, err
 		}
 		if !deferredJobResultPlaceholderMatches(job, desired, run) {
-			return false, &terminalPlanningError{cause: fmt.Errorf("WorkflowJob %q does not match deferred job %q in WorkflowRun %q", job.Name, plan.JobID, run.Name)}
+			return false, &terminalPlanningError{cause: fmt.Errorf("WorkflowJob %q does not match deferred job %q in WorkflowRun %q", job.Name, desired.Spec.JobID, run.Name)}
 		}
 	} else {
 		created = true
@@ -3120,6 +3214,26 @@ func (r *WorkflowRunReconciler) completeDeferredJobPlanning(ctx context.Context,
 		return created, err
 	}
 	return true, nil
+}
+
+func (r *WorkflowRunReconciler) deferredJobResultPlaceholders(run *actionsv1alpha1.WorkflowRun, planConfigMap *corev1.ConfigMap, plan deferredJobPlan) ([]*actionsv1alpha1.WorkflowJob, error) {
+	if len(plan.RerunJobs) == 0 {
+		job, err := r.deferredJobResultPlaceholder(run, planConfigMap, plan)
+		return []*actionsv1alpha1.WorkflowJob{job}, err
+	}
+	jobs := make([]*actionsv1alpha1.WorkflowJob, 0, len(plan.RerunJobs))
+	for _, selected := range plan.RerunJobs {
+		child := plan
+		child.JobID = selected.ID
+		job, err := r.deferredJobResultPlaceholder(run, planConfigMap, child)
+		if err != nil {
+			return nil, err
+		}
+		job.Spec.Matrix = selected.Matrix.DeepCopy()
+		job.Spec.DisplayName = matrixDisplayName(plan.JobID, selected.Values)
+		jobs = append(jobs, job)
+	}
+	return jobs, nil
 }
 
 func (r *WorkflowRunReconciler) deferredJobResultPlaceholder(run *actionsv1alpha1.WorkflowRun, planConfigMap *corev1.ConfigMap, plan deferredJobPlan) (*actionsv1alpha1.WorkflowJob, error) {
@@ -3165,9 +3279,15 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 	if err := reader.List(ctx, jobs, client.InNamespace(run.Namespace), client.MatchingLabels{actionsv1alpha1.LabelWorkflowRunUID: string(run.UID)}); err != nil {
 		return ctrl.Result{}, err
 	}
+	lostState := ""
 	planState, err := r.reconcileDeferredJobs(ctx, run, jobs)
 	if err != nil {
-		return ctrl.Result{}, err
+		terminal := &terminalPlanningError{}
+		if run.Spec.Rerun == nil || !errors.As(err, &terminal) {
+			return ctrl.Result{}, err
+		}
+		lostState = err.Error()
+		planState = workflowPlanState{}
 	}
 	if planState.changed {
 		return ctrl.Result{Requeue: true}, nil
@@ -3185,11 +3305,10 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 	}
 	status := &actionsv1alpha1.WorkflowRunJobStatus{Total: total, Waiting: int32(len(pendingJobs))}
 	var startTime *metav1.Time
-	lostState := ""
 	waitingForRuntimeState := false
 	hasNonFailFastCancellation := false
 	hasFailure := false
-	if len(jobs.Items) != expectedObjects {
+	if lostState == "" && len(jobs.Items) != expectedObjects {
 		active, err := activeRuntimeWorkloads(ctx, reader, run)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -3200,8 +3319,12 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 			lostState = fmt.Sprintf("expected %d WorkflowJobs, found %d", expectedObjects, len(jobs.Items))
 		}
 	}
-	if len(jobs.Items) == expectedObjects {
-		dependencyJobs, dependencyErr := r.rerunDependencyWorkflowJobs(ctx, run, jobs.Items)
+	if lostState == "" && len(jobs.Items) == expectedObjects {
+		dependencyJobs := planState.dependencies
+		var dependencyErr error
+		if !planState.active {
+			dependencyJobs, dependencyErr = r.rerunDependencyWorkflowJobs(ctx, run, jobs.Items)
+		}
 		if dependencyErr != nil {
 			terminal := &terminalPlanningError{}
 			if !errors.As(dependencyErr, &terminal) {
@@ -3358,7 +3481,7 @@ func (r *WorkflowRunReconciler) observeWorkflowJobs(ctx context.Context, run *ac
 		Reason:             "JobsPlanned",
 		Message:            plannedMessage,
 	})
-	terminal := len(pendingJobs) == 0 && len(jobs.Items) == expectedObjects && status.Succeeded+status.Failed+status.TimedOut+status.Skipped+status.Cancelled == status.Total
+	terminal := !waitingForRuntimeState && len(pendingJobs) == 0 && len(jobs.Items) == expectedObjects && status.Succeeded+status.Failed+status.TimedOut+status.Skipped+status.Cancelled == status.Total
 	if terminal && status.Cancelled > 0 {
 		active, err := activeRuntimeWorkloads(ctx, reader, run)
 		if err != nil {
@@ -3518,12 +3641,12 @@ func (r *WorkflowRunReconciler) reconcileWorkflowJobGraphWithDependencies(ctx co
 		}
 		dependenciesReady := true
 		for _, dependency := range job.Spec.Needs {
+			if _, pending := pendingJobs[dependency]; pending {
+				dependenciesReady = false
+				continue
+			}
 			needed := jobsByLogicalID[dependency]
 			if len(needed) == 0 {
-				if _, pending := pendingJobs[dependency]; pending {
-					dependenciesReady = false
-					continue
-				}
 				return fmt.Errorf("WorkflowJob %q needs missing job %q in WorkflowRun %q", job.Name, dependency, run.Name)
 			}
 			for _, dependencyJob := range needed {

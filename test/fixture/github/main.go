@@ -26,6 +26,7 @@ const tokenPermissionsWorkflowPath = ".open-actions/workflows/token-permissions.
 const jobConcurrencyWorkflowPath = ".open-actions/workflows/job-concurrency.yaml"
 const concurrencyConflictWorkflowPath = ".open-actions/workflows/concurrency-conflict.yaml"
 const selectiveRerunWorkflowPath = ".open-actions/workflows/selective-rerun.yaml"
+const selectiveMatrixRerunWorkflowPath = ".open-actions/workflows/selective-matrix-rerun.yaml"
 const fixtureJobToken = "fixture-job-token"
 const fixtureActionToken = "fixture-action-token"
 
@@ -242,6 +243,37 @@ jobs:
           test '${{ needs.prepare.outputs.marker }}' = attempt-1
           test "$GITHUB_RUN_ATTEMPT" = 2
           printf 'selective rerun dependency reuse works\n'
+`
+
+const selectiveMatrixRerunWorkflowData = `name: Selective matrix rerun
+on: push
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      marker: ${{ steps.prepare.outputs.marker }}
+      projects: ${{ steps.prepare.outputs.projects }}
+    steps:
+      - id: prepare
+        run: |
+          printf 'marker=attempt-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+          echo 'projects=["one","two"]' >> "$GITHUB_OUTPUT"
+  verify:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJSON(needs.prepare.outputs.projects) }}
+    steps:
+      - name: Verify inherited dependency and matrix selection
+        run: |
+          test '${{ needs.prepare.outputs.marker }}' = attempt-1
+          if [ '${{ matrix.project }}' = two ]; then
+            test "$GITHUB_RUN_ATTEMPT" = 2
+          else
+            test "$GITHUB_RUN_ATTEMPT" = 1
+          fi
 `
 
 const pullRequestWorkflowPath = ".open-actions/workflows/pull-request.yaml"
@@ -852,6 +884,10 @@ func main() {
 	})
 	mux.HandleFunc("/repos/acme/example/contents/"+selectiveRerunWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(selectiveRerunWorkflowData))})
+	})
+
+	mux.HandleFunc("/repos/acme/example/contents/"+selectiveMatrixRerunWorkflowPath, func(writer http.ResponseWriter, _ *http.Request) {
+		writeJSON(writer, map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(selectiveMatrixRerunWorkflowData))})
 	})
 	commitStatusMutex := sync.RWMutex{}
 	commitStatuses := map[string]map[string]any{}
