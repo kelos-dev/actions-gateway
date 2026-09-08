@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"encoding/json"
 	"fmt"
 	"maps"
 	"os"
@@ -1609,5 +1610,38 @@ func TestParseRejectsLongWorkflowName(t *testing.T) {
 	data := []byte("name: " + name + "\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n")
 	if _, err := Parse(data); err == nil {
 		t.Errorf("Parse() accepted workflow name with %d characters", len(name))
+	}
+}
+
+func TestJobTimeoutSurvivesPersistedPlanning(t *testing.T) {
+	for _, test := range []struct {
+		name, field string
+		want        int64
+	}{
+		{name: "default", want: 360},
+		{name: "literal", field: "    timeout-minutes: 12\n", want: 12},
+		{name: "expression", field: "    timeout-minutes: ${{ fromJSON(needs.prepare.outputs.timeout) }}\n", want: 7},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			definition, err := Parse([]byte("on: push\njobs:\n  prepare:\n    runs-on: linux\n    steps:\n      - run: prepare\n  build:\n    needs: prepare\n    runs-on: linux\n" + test.field + "    steps:\n      - run: build\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := json.Marshal(definition.Jobs["build"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			var job Job
+			if err := json.Unmarshal(data, &job); err != nil {
+				t.Fatal(err)
+			}
+			resolved, err := EvaluateJob("build", job, workflowexpression.Context{Availability: workflowexpression.NewAvailability("needs"), Values: map[string]any{"needs": map[string]any{"prepare": map[string]any{"outputs": map[string]any{"timeout": "7"}}}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resolved.TimeoutMinutes.Minutes() != test.want {
+				t.Fatalf("timeout = %d, want %d", resolved.TimeoutMinutes.Minutes(), test.want)
+			}
+		})
 	}
 }

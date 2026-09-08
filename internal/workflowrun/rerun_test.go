@@ -64,3 +64,37 @@ func TestFailedJobIDsIncludesMatrixFailFastCancellations(t *testing.T) {
 		t.Fatalf("failed job IDs = %v, want %v", jobIDs, want)
 	}
 }
+
+func TestJobHistoryReplacesDeferredExpansions(t *testing.T) {
+	matrix := func(id string, total int32) actionsv1alpha1.WorkflowJob {
+		return actionsv1alpha1.WorkflowJob{Spec: actionsv1alpha1.WorkflowJobSpec{JobID: id, Matrix: &actionsv1alpha1.WorkflowJobMatrix{LogicalJobID: "build", JobTotal: total}}}
+	}
+	root := &actionsv1alpha1.WorkflowRun{}
+	tests := []struct {
+		name     string
+		current  []actionsv1alpha1.WorkflowJob
+		selected []string
+		previous []actionsv1alpha1.WorkflowJob
+		want     []string
+	}{
+		{name: "partial matrix retains sibling", current: []actionsv1alpha1.WorkflowJob{matrix("build-matrix-2", 2)}, selected: []string{"build-matrix-2"}, previous: []actionsv1alpha1.WorkflowJob{matrix("build-matrix-1", 2), matrix("build-matrix-2", 2)}, want: []string{"build-matrix-1"}},
+		{name: "complete matrix replaces placeholder", current: []actionsv1alpha1.WorkflowJob{matrix("build-matrix-1", 1)}, selected: []string{"build"}, previous: []actionsv1alpha1.WorkflowJob{{Spec: actionsv1alpha1.WorkflowJobSpec{JobID: "build"}}}},
+		{name: "smaller matrix replaces removed children", current: []actionsv1alpha1.WorkflowJob{matrix("build-matrix-1", 1)}, previous: []actionsv1alpha1.WorkflowJob{matrix("build-matrix-1", 2), matrix("build-matrix-2", 2)}},
+		{name: "pending selection excludes previous execution", selected: []string{"build-matrix-2"}, previous: []actionsv1alpha1.WorkflowJob{matrix("build-matrix-1", 2), matrix("build-matrix-2", 2)}, want: []string{"build-matrix-1"}},
+		{name: "logical selection excludes previous expansion", selected: []string{"build"}, previous: []actionsv1alpha1.WorkflowJob{matrix("build-matrix-1", 2), matrix("build-matrix-2", 2)}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			history := &JobHistory{}
+			current := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Rerun: &actionsv1alpha1.WorkflowRunRerun{JobIDs: test.selected}}}
+			history.Add(current, test.current)
+			var ids []string
+			for _, job := range history.Add(root, test.previous) {
+				ids = append(ids, job.Spec.JobID)
+			}
+			if !slices.Equal(ids, test.want) {
+				t.Fatalf("retained jobs = %v, want %v", ids, test.want)
+			}
+		})
+	}
+}

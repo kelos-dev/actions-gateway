@@ -236,6 +236,27 @@ type JobTimeout struct {
 	configured bool
 }
 
+type jobTimeoutJSON struct {
+	Minutes    int64  `json:"minutes,omitempty"`
+	Expression string `json:"expression,omitempty"`
+	Configured bool   `json:"configured,omitempty"`
+}
+
+// MarshalJSON preserves timeout settings in persisted job plans.
+func (t JobTimeout) MarshalJSON() ([]byte, error) {
+	return json.Marshal(jobTimeoutJSON{Minutes: t.minutes, Expression: t.expression, Configured: t.configured})
+}
+
+// UnmarshalJSON restores timeout settings from a persisted job plan.
+func (t *JobTimeout) UnmarshalJSON(data []byte) error {
+	var value jobTimeoutJSON
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*t = JobTimeout{minutes: value.Minutes, expression: value.Expression, configured: value.Configured}
+	return nil
+}
+
 // Minutes returns the resolved timeout, including GitHub's default when the
 // workflow omits timeout-minutes.
 func (t JobTimeout) Minutes() int64 {

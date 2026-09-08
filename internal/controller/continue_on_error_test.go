@@ -296,7 +296,7 @@ func TestJobContinueOnErrorPlanning(t *testing.T) {
 			if test.deferred && (len(planned) != 1 || len(deferred) != 1 || deferred[0].JobID != "test") {
 				t.Fatalf("planned = %#v, deferred = %#v", planned, deferred)
 			}
-			if err := reconciler.ensureWorkflowPlan(ctx, run, project, planned, deferred); err != nil {
+			if err := reconciler.ensureWorkflowPlan(ctx, run, project, planned, deferred, definition); err != nil {
 				t.Fatal(err)
 			}
 			if err := reconciler.ensureWorkflowJobs(ctx, run, project, planned); err != nil {

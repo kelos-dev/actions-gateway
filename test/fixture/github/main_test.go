@@ -78,11 +78,13 @@ func TestConcurrencyWorkflowsAreValid(t *testing.T) {
 }
 
 func TestSelectiveRerunWorkflowIsValid(t *testing.T) {
-	definition, err := workflow.Parse([]byte(selectiveRerunWorkflowData))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(definition.Jobs) != 2 || len(definition.Jobs["verify"].Needs) != 1 || definition.Jobs["verify"].Needs[0] != "prepare" {
-		t.Fatalf("jobs = %#v", definition.Jobs)
+	for _, data := range []string{selectiveRerunWorkflowData, selectiveMatrixRerunWorkflowData} {
+		definition, err := workflow.Parse([]byte(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(definition.Jobs) != 2 || len(definition.Jobs["verify"].Needs) != 1 || definition.Jobs["verify"].Needs[0] != "prepare" {
+			t.Fatalf("jobs = %#v", definition.Jobs)
+		}
 	}
 }

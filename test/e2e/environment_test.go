@@ -48,6 +48,8 @@ const (
 	dockerImage                     = "docker:29.7.2-dind@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07"
 )
 
+const selectiveMatrixRerunWorkflowPath = ".open-actions/workflows/selective-matrix-rerun.yaml"
+
 const tokenPermissionsWorkflowPath = ".open-actions/workflows/token-permissions.yaml"
 
 var (

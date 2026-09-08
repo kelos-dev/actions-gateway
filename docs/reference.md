@@ -105,7 +105,19 @@ the administrator can instead rerun the failed expanded job IDs, matrix
 combinations cancelled by fail-fast, and their transitive dependents.
 Jobs in the new attempt reuse the latest results and outputs of prerequisites
 that completed in earlier attempts instead of executing those prerequisites
-again. A selective rerun's Console page shows those retained jobs alongside the
+again. This includes jobs whose matrix or configuration depends on `needs`.
+An individually selected matrix job retains its matrix values and strategy
+index from its earlier attempt. If a prerequisite and all combinations of a
+dependent matrix are selected, the matrix expands using that prerequisite's
+outputs from the new attempt. A deferred job skipped before its matrix could
+expand can also expand after its rerun prerequisites succeed. Superseded matrix
+combinations are excluded from the effective job history. Selective reruns
+require retained prerequisite WorkflowJobs and, for individually selected matrix
+jobs, their plan ConfigMaps; missing history during planning causes `RerunInvalid`.
+If required execution state is lost after planning, the rerun completes with
+`ExecutionStateLost` once its active Kubernetes Jobs and Pods finish. The attempt
+remains in rerun history, so the next rerun uses the next attempt number.
+A selective rerun's Console page shows those retained jobs alongside the
 jobs executed by the current attempt, and their log links remain available as
 long as the earlier WorkflowJobs and runner logs are retained.
 The Console creates a new immutable WorkflowRun attempt with the same project,

@@ -25,7 +25,7 @@ var _ = Describe("Reruns", func() {
 		setupTestProject(true)
 	})
 
-	It("reuses successful prerequisite results when rerunning failed jobs", func() {
+	DescribeTable("reuses successful prerequisite results when rerunning failed jobs", func(workflowPath, failedJobID string, rootJobCount int) {
 		ctx := context.Background()
 		root := &actionsv1alpha1.WorkflowRun{
 			ObjectMeta: metav1.ObjectMeta{Name: "selective-rerun", Namespace: e2eNamespace},
@@ -42,7 +42,7 @@ var _ = Describe("Reruns", func() {
 						Revision: actionsv1alpha1.GitRevision{SHA: fixtureRevision, Ref: "refs/heads/main"},
 					},
 				},
-				WorkflowPath: selectiveRerunWorkflowPath,
+				WorkflowPath: workflowPath,
 			},
 		}
 		Expect(clusterClient.Create(ctx, root)).To(Succeed())
@@ -62,14 +62,16 @@ var _ = Describe("Reruns", func() {
 		Expect(clusterClient.List(ctx, rootJobs, client.InNamespace(e2eNamespace), client.MatchingLabels{
 			actionsv1alpha1.LabelWorkflowRunUID: string(root.UID),
 		})).To(Succeed())
-		Expect(rootJobs.Items).To(HaveLen(2))
+		Expect(rootJobs.Items).To(HaveLen(rootJobCount))
 		for index := range rootJobs.Items {
 			job := &rootJobs.Items[index]
 			switch job.Spec.JobID {
 			case "prepare":
 				Expect(job.Status.Result).To(Equal(actionsv1alpha1.WorkflowJobResultSuccess))
 				Expect(job.Status.Outputs).To(HaveKeyWithValue("marker", "attempt-1"))
-			case "verify":
+			case "verify-matrix-1":
+				Expect(job.Status.Result).To(Equal(actionsv1alpha1.WorkflowJobResultSuccess))
+			case failedJobID:
 				Expect(job.Status.Result).To(Equal(actionsv1alpha1.WorkflowJobResultFailure))
 			default:
 				Fail("unexpected WorkflowJob " + job.Spec.JobID)
@@ -115,7 +117,7 @@ var _ = Describe("Reruns", func() {
 			g.Expect(rerun.Spec.Rerun).NotTo(BeNil())
 			if rerun.Spec.Rerun != nil {
 				g.Expect(rerun.Spec.Rerun.Attempt).To(Equal(int32(2)))
-				g.Expect(rerun.Spec.Rerun.JobIDs).To(ConsistOf("verify"))
+				g.Expect(rerun.Spec.Rerun.JobIDs).To(ConsistOf(failedJobID))
 			}
 			condition := meta.FindStatusCondition(rerun.Status.Conditions, actionsv1alpha1.WorkflowRunConditionSucceeded)
 			g.Expect(condition).NotTo(BeNil())
@@ -136,7 +138,10 @@ var _ = Describe("Reruns", func() {
 			actionsv1alpha1.LabelWorkflowRunUID: string(rerun.UID),
 		})).To(Succeed())
 		Expect(rerunJobs.Items).To(HaveLen(1))
-		Expect(rerunJobs.Items[0].Spec.JobID).To(Equal("verify"))
+		Expect(rerunJobs.Items[0].Spec.JobID).To(Equal(failedJobID))
 		Expect(rerunJobs.Items[0].Status.Result).To(Equal(actionsv1alpha1.WorkflowJobResultSuccess))
-	})
+	},
+		Entry("ordinary jobs", selectiveRerunWorkflowPath, "verify", 2),
+		Entry("output-derived matrix", selectiveMatrixRerunWorkflowPath, "verify-matrix-2", 3),
+	)
 })
