@@ -107,7 +107,7 @@ type WorkflowRunForkPullRequest struct {
 	// +required
 	SendWriteTokens bool `json:"sendWriteTokens"`
 
-	// SendSecrets makes the Project Secret available to this workflow.
+	// SendSecrets makes shared Project and repository secrets available to this workflow.
 	// +required
 	SendSecrets bool `json:"sendSecrets"`
 }

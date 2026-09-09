@@ -1064,14 +1064,18 @@ func TestPlanWorkflowJobsResolvesOnlyPlanningVariables(t *testing.T) {
 		t.Fatal(err)
 	}
 	variables := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "project-variables", Namespace: "default"}, Data: map[string]string{
-		"ENVIRONMENT": "production",
+		"ENVIRONMENT": "project",
 		"RUNNER":      "ubuntu-latest",
 	}}
-	reader := &countingReader{Reader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(variables).Build()}
+	repositoryVariables := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "repository-variables", Namespace: "default"}, Data: map[string]string{"ENVIRONMENT": "production"}}
+	reader := &countingReader{Reader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(variables, repositoryVariables).Build()}
 	reconciler := &WorkflowRunReconciler{APIReader: reader}
 	project := &actionsv1alpha1.Project{
 		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default"},
-		Spec:       actionsv1alpha1.ProjectSpec{Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: corev1.LocalObjectReference{Name: variables.Name}}},
+		Spec: actionsv1alpha1.ProjectSpec{
+			Variables:    &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: actionsv1alpha1.ProjectValueReference{Name: variables.Name}},
+			Repositories: []actionsv1alpha1.ProjectRepositoryValues{{Name: "acme/example", Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: actionsv1alpha1.ProjectValueReference{Name: repositoryVariables.Name}}}},
+		},
 	}
 	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{Source: actionsv1alpha1.WorkflowRunSource{
 		Type: actionsv1alpha1.SourceTypeGitHub,
@@ -1089,7 +1093,7 @@ func TestPlanWorkflowJobsResolvesOnlyPlanningVariables(t *testing.T) {
 			Steps:  []workflow.Step{{Run: "deploy '${{ secrets.DEPLOY_TOKEN }}' to '$ENVIRONMENT'"}},
 		},
 	}}
-	variablesContext := reconciler.projectVariableContext(context.Background(), project)
+	variablesContext := reconciler.projectVariableContext(context.Background(), project, run)
 	setTestWorkflowRunIdentity(run)
 	planned, _, err := reconciler.planWorkflowJobs(run, definition, nil, variablesContext, nil)
 	if err != nil {
@@ -1120,8 +1124,8 @@ func TestPlanWorkflowJobsResolvesOnlyPlanningVariables(t *testing.T) {
 	if len(allVariables) != 2 || allVariables["ENVIRONMENT"] != "production" || allVariables["RUNNER"] != "ubuntu-latest" {
 		t.Fatalf("variables = %#v", allVariables)
 	}
-	if reader.getCount != 1 {
-		t.Fatalf("ConfigMap reads = %d, want 1", reader.getCount)
+	if reader.getCount != 2 {
+		t.Fatalf("ConfigMap reads = %d, want 2", reader.getCount)
 	}
 }
 
@@ -5231,10 +5235,10 @@ func TestProjectValuePlanningFailureRemainsRetryable(t *testing.T) {
 	reconciler := &WorkflowRunReconciler{Client: clusterClient, APIReader: clusterClient}
 	project := &actionsv1alpha1.Project{
 		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default"},
-		Spec:       actionsv1alpha1.ProjectSpec{Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: corev1.LocalObjectReference{Name: "missing"}}},
+		Spec:       actionsv1alpha1.ProjectSpec{Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: actionsv1alpha1.ProjectValueReference{Name: "missing"}}},
 	}
 	definition := &workflow.Definition{Name: "Deploy", Concurrency: workflow.Concurrency{Group: "deploy-${{ vars.ENVIRONMENT }}"}}
-	_, _, cause := workflow.EvaluateConcurrency(definition, workflow.Event{}, reconciler.projectVariableContext(context.Background(), project))
+	_, _, cause := workflow.EvaluateConcurrency(definition, workflow.Event{}, reconciler.projectVariableContext(context.Background(), project, run))
 	var unavailable *projectValuesUnavailableError
 	if !errors.As(cause, &unavailable) {
 		t.Fatalf("EvaluateConcurrency() error = %v", cause)

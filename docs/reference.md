@@ -436,7 +436,7 @@ as follows:
 | `enabled` | **Run workflows from fork pull requests** | Creates ordinary fork `pull_request` runs when true. |
 | `requireApproval` | **Require approval for fork pull request workflows** | Creates the run but no WorkflowJobs until an authenticated Console user approves it. Open Actions applies this requirement to every fork run rather than evaluating contributor history. |
 | `sendWriteTokens` | **Send write tokens to workflows from pull requests** | Preserves requested write permissions when true; otherwise requested writes are reduced to reads. |
-| `sendSecrets` | **Send secrets and variables to workflows from pull requests** | Makes the Project Secret available when true. Project variables are non-sensitive and remain available independently of this setting. |
+| `sendSecrets` | **Send secrets and variables to workflows from pull requests** | Makes shared Project and repository secrets available when true. Variables are non-sensitive and remain available independently of this setting. |
 
 GitHub exposes the four settings for private repositories and exposes
 contributor-based approval policies for public repositories. Because a Project
@@ -464,14 +464,33 @@ older approval-pending runs for the same pull request as `RevisionSuperseded`.
 
 ### Project secrets and variables
 
-A Project selects one namespace-local Secret through
-`spec.secrets.secretRef` and one namespace-local ConfigMap through
-`spec.variables.configMapRef`. Each key becomes a name in the corresponding
+A Project defines shared defaults through `spec.secrets.secretRef` and
+`spec.variables.configMapRef`. These values are shared by every repository in
+the Project's GitHub App installation, which belongs to an organization or a
+personal account. The values come from Kubernetes; Open Actions does not read
+GitHub organization secrets or variables or model their repository-access
+policies. Add `spec.repositories` entries to provide secrets or variables for
+individual repositories. Each entry's `name` is a unique lowercase
+`owner/repository` name, matched without regard to case
+against the WorkflowRun's source repository. Up to 1,000 repository entries are
+supported; each must specify `secrets`, `variables`, or both. A repository entry
+configures values, without restricting which repositories can run workflows.
+
+Repository values override shared Project values with the same name, including
+when the repository value is empty. Other shared Project values remain available.
+Repositories without an entry receive only shared Project defaults. Project
+and repository sources are optional independently. This precedence follows
+GitHub's [secret precedence](https://docs.github.com/en/actions/reference/security/secrets#naming-your-secrets)
+and [variable precedence](https://docs.github.com/en/actions/reference/workflows-and-actions/variables#configuration-variable-precedence).
+
+Every Secret and ConfigMap reference is local to the Project's namespace.
+Each key becomes a name in the corresponding
 `secrets` or `vars` workflow context. Keys must use the canonical uppercase
 GitHub representation: letters, digits, and `_`, without a leading digit or
-the reserved `GITHUB_` prefix. A Project supports up to 100 secrets and 500
-variables. Individual values are limited to 48 KiB, Secret values must be valid
-UTF-8, and the variable ConfigMap must not contain `binaryData`.
+the reserved `GITHUB_` prefix. Each referenced Secret supports up to 100 secrets
+and each ConfigMap supports up to 500 variables. Individual values are limited
+to 48 KiB, Secret values must be valid UTF-8, and variable ConfigMaps must not
+contain `binaryData`.
 
 ```yaml
 spec:
@@ -481,20 +500,38 @@ spec:
   variables:
     configMapRef:
       name: project-variables
+  repositories:
+    - name: acme/example
+      secrets:
+        secretRef:
+          name: example-secrets
+      variables:
+        configMapRef:
+          name: example-variables
 ```
 
-The Project remains unconfigured while a referenced object is missing or its
-contents violate these constraints. Variables needed for workflow concurrency,
-job names, or runner labels are read during planning; job conditions and job
-concurrency read them when dependencies settle. Job and step expressions remain
-unresolved in the immutable plan. Kubernetes mounts the Secret and ConfigMap
-into runner-only, read-only volumes when a job Pod starts, and the runner reads
+The Project remains unconfigured while any shared or repository-specific object
+is missing or its contents violate these constraints. This affects every
+repository in the installation: once the Project is marked unconfigured,
+webhook deliveries are rejected, scheduled runs are not created, and runners
+cannot start jobs. Consider this shared impact when delegating management of
+repository Secrets and ConfigMaps.
+
+Variables needed for workflow concurrency, job names, or runner labels are read
+during planning; job conditions and job concurrency read them when dependencies
+settle. Job and step expressions remain
+unresolved in the immutable plan. Planning and execution both apply repository
+overrides. Kubernetes mounts the selected Secrets and ConfigMaps into
+runner-only, read-only volumes when a job Pod starts, and the runner reads
 a consistent snapshot at startup. Rotations apply to new jobs. The Docker
 sidecar does not mount these volumes, and workflow commands do not receive the
 internal files as ambient environment variables.
 
 See the [Project value source sample](../config/samples/actions_v1alpha1_project-values.yaml)
 for a complete Project manifest.
+
+The Console's Project secret editor manages the shared Project Secret.
+Manage repository Secrets and variable ConfigMaps through Kubernetes.
 
 Secret values never enter job-plan ConfigMaps, custom-resource specs or status,
 controller logs, or Console records. The runner marks values derived from the
@@ -506,8 +543,9 @@ to match GitHub's debug-secret whitelist; their values can therefore appear in
 logs and outputs. Project variables are non-sensitive and are not masked.
 Missing names in either context evaluate to an empty string.
 
-For fork pull request runs, the Project Secret is mounted only when the run's
-policy snapshot has `sendSecrets: true`. Project variables remain available.
+For fork pull request runs, shared Project and repository Secrets are mounted only
+when the run's policy snapshot has `sendSecrets: true`. Variables from both
+scopes remain available.
 The job-scoped GitHub App installation token is available as both
 `github.token` and `secrets.GITHUB_TOKEN`. It is not added to the step
 environment unless the workflow assigns one of those expressions to an

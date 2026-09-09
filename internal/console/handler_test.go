@@ -1727,7 +1727,7 @@ jobs:
 		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", Generation: 1},
 		Spec: actionsv1alpha1.ProjectSpec{
 			Source:  actionsv1alpha1.ProjectSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubAppConfiguration{AppID: 1, InstallationID: 2}},
-			Secrets: &actionsv1alpha1.ProjectSecretSource{SecretRef: corev1.LocalObjectReference{Name: "project-secrets"}},
+			Secrets: &actionsv1alpha1.ProjectSecretSource{SecretRef: actionsv1alpha1.ProjectValueReference{Name: "project-secrets"}},
 		},
 		Status: actionsv1alpha1.ProjectStatus{ObservedGeneration: 1, Conditions: []metav1.Condition{{
 			Type: actionsv1alpha1.ProjectConditionConfigured, Status: metav1.ConditionTrue, ObservedGeneration: 1, Reason: "ConfigurationValid", Message: "Configuration is valid",

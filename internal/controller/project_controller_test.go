@@ -43,8 +43,8 @@ func TestProjectConfiguredConditionDescribesLocalValidation(t *testing.T) {
 					WebhookSecretRef:    corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "webhook-secret"},
 				},
 			},
-			Secrets:   &actionsv1alpha1.ProjectSecretSource{SecretRef: corev1.LocalObjectReference{Name: "workflow-secrets"}},
-			Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: corev1.LocalObjectReference{Name: "workflow-variables"}},
+			Secrets:   &actionsv1alpha1.ProjectSecretSource{SecretRef: actionsv1alpha1.ProjectValueReference{Name: "workflow-secrets"}},
+			Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: actionsv1alpha1.ProjectValueReference{Name: "workflow-variables"}},
 		},
 	}
 	secret := &corev1.Secret{
@@ -103,8 +103,8 @@ func TestProjectValueSourceChangesEnqueueReferencingProjects(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "team"},
 		Spec: actionsv1alpha1.ProjectSpec{
 			Source:    actionsv1alpha1.ProjectSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubAppConfiguration{}},
-			Secrets:   &actionsv1alpha1.ProjectSecretSource{SecretRef: corev1.LocalObjectReference{Name: "workflow-secrets"}},
-			Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: corev1.LocalObjectReference{Name: "workflow-variables"}},
+			Secrets:   &actionsv1alpha1.ProjectSecretSource{SecretRef: actionsv1alpha1.ProjectValueReference{Name: "workflow-secrets"}},
+			Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: actionsv1alpha1.ProjectValueReference{Name: "workflow-variables"}},
 		},
 	}
 	other := project.DeepCopy()

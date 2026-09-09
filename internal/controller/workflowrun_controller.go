@@ -548,7 +548,7 @@ func (r *WorkflowRunReconciler) reconcileWorkflowRun(ctx context.Context, run *a
 	if err != nil {
 		return r.planningFailed(ctx, run, "TriggerInvalid", err, planningFailureTerminal)
 	}
-	variables := r.projectVariableContext(ctx, project)
+	variables := r.projectVariableContext(ctx, project, run)
 	if concurrency := workflowRunConcurrencyDecision(run); concurrency == nil {
 		expressionContext := r.jobExpressionContext(planningRun, definition.Name, planningEvent.InputValues, variables, eventPayload)
 		concurrencyGroup, cancelInProgress, err := workflow.EvaluateConcurrencyContext(definition, expressionContext)
@@ -2137,8 +2137,9 @@ func (r *WorkflowRunReconciler) jobExpressionContext(run *actionsv1alpha1.Workfl
 	}
 }
 
-func (r *WorkflowRunReconciler) projectVariableContext(ctx context.Context, project *actionsv1alpha1.Project) workflowexpression.DeferredObjectMap {
-	var values map[string]string
+func (r *WorkflowRunReconciler) projectVariableContext(ctx context.Context, project *actionsv1alpha1.Project, run *actionsv1alpha1.WorkflowRun) workflowexpression.DeferredObjectMap {
+	values := map[string]string{}
+	origins := map[string]string{}
 	var loadError error
 	loaded := false
 	load := func() {
@@ -2146,16 +2147,16 @@ func (r *WorkflowRunReconciler) projectVariableContext(ctx context.Context, proj
 			return
 		}
 		loaded = true
-		if project.Spec.Variables == nil {
-			values = map[string]string{}
-			return
-		}
-		configMapName := project.Spec.Variables.ConfigMapRef.Name
-		configMap := &corev1.ConfigMap{}
-		if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: project.Namespace, Name: configMapName}, configMap); err != nil {
-			loadError = fmt.Errorf("Project %q: get ConfigMap %q: %w", project.Name, configMapName, err)
-		} else {
-			values = configMap.Data
+		for _, source := range workflowRunValueSources(project, run).variables {
+			configMap := &corev1.ConfigMap{}
+			if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: project.Namespace, Name: source.Name}, configMap); err != nil {
+				loadError = fmt.Errorf("Project %q: get ConfigMap %q: %w", project.Name, source.Name, err)
+				return
+			}
+			for name, value := range configMap.Data {
+				values[name] = value
+				origins[name] = source.Name
+			}
 		}
 	}
 	resolve := func(name string) (any, bool, error) {
@@ -2169,7 +2170,7 @@ func (r *WorkflowRunReconciler) projectVariableContext(ctx context.Context, proj
 			return nil, false, nil
 		}
 		if len(value) > projectvalue.MaxValueBytes {
-			configMapName := project.Spec.Variables.ConfigMapRef.Name
+			configMapName := origins[name]
 			cause := fmt.Errorf("Project %q ConfigMap %q key %q exceeds %d bytes", project.Name, configMapName, name, projectvalue.MaxValueBytes)
 			return nil, true, &projectValuesUnavailableError{cause: cause}
 		}
@@ -2183,7 +2184,7 @@ func (r *WorkflowRunReconciler) projectVariableContext(ctx context.Context, proj
 		result := make(map[string]any, len(values))
 		for name, value := range values {
 			if len(value) > projectvalue.MaxValueBytes {
-				configMapName := project.Spec.Variables.ConfigMapRef.Name
+				configMapName := origins[name]
 				cause := fmt.Errorf("Project %q ConfigMap %q key %q exceeds %d bytes", project.Name, configMapName, name, projectvalue.MaxValueBytes)
 				return nil, &projectValuesUnavailableError{cause: cause}
 			}
@@ -2225,7 +2226,7 @@ func (r *WorkflowRunReconciler) workflowRunVariableContext(ctx context.Context, 
 			if err := r.APIReader.Get(ctx, key, project); err != nil {
 				loadError = fmt.Errorf("get Project %q: %w", key.Name, err)
 			} else {
-				variables = r.projectVariableContext(ctx, project)
+				variables = r.projectVariableContext(ctx, project, run)
 			}
 		}
 	}
