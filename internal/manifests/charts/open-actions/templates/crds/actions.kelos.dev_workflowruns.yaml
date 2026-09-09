@@ -88,8 +88,8 @@ spec:
                       before planning.
                     type: boolean
                   sendSecrets:
-                    description: SendSecrets makes the Project Secret available to
-                      this workflow.
+                    description: SendSecrets makes shared Project and repository secrets
+                      available to this workflow.
                     type: boolean
                   sendWriteTokens:
                     description: SendWriteTokens preserves write permissions requested

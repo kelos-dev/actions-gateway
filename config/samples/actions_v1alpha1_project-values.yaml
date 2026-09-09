@@ -10,6 +10,14 @@ spec:
   variables:
     configMapRef:
       name: open-actions-project-variables
+  repositories:
+    - name: acme/example
+      secrets:
+        secretRef:
+          name: example-secrets
+      variables:
+        configMapRef:
+          name: example-variables
   source:
     type: GitHub
     github:

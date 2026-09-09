@@ -572,12 +572,13 @@ func (r *RunnerReconciler) executeWorkflowJob(ctx context.Context, runnerObject 
 	if err := r.validateEventSnapshot(ctx, run); err != nil {
 		return false, err
 	}
+	sources := workflowRunValueSources(project, run)
 	if workflowRunUsesProjectSecrets(run) {
-		if err := validateProjectSecretValues(ctx, r.APIReader, project); err != nil {
+		if err := validateProjectSecretValues(ctx, r.APIReader, project, sources.secrets); err != nil {
 			return false, err
 		}
 	}
-	if err := validateProjectVariableValues(ctx, r.APIReader, project); err != nil {
+	if err := validateProjectVariableValues(ctx, r.APIReader, project, sources.variables); err != nil {
 		return false, err
 	}
 	githubConfig := project.Spec.Source.GitHub
@@ -1283,24 +1284,29 @@ func (r *RunnerReconciler) validateEventSnapshot(ctx context.Context, run *actio
 
 func configureProjectValues(pod *corev1.PodSpec, container *corev1.Container, run *actionsv1alpha1.WorkflowRun, project *actionsv1alpha1.Project) {
 	mode := int32(0o440)
-	if workflowRunUsesProjectSecrets(run) && project.Spec.Secrets != nil {
+	// Preserve the source order: kubelet lets later projections replace earlier
+	// paths, giving repository values precedence over shared Project values.
+	sources := workflowRunValueSources(project, run)
+	if workflowRunUsesProjectSecrets(run) && len(sources.secrets) > 0 {
+		projections := make([]corev1.VolumeProjection, 0, len(sources.secrets))
+		for _, source := range sources.secrets {
+			projections = append(projections, corev1.VolumeProjection{Secret: &corev1.SecretProjection{LocalObjectReference: source}})
+		}
 		pod.Volumes = append(pod.Volumes, corev1.Volume{
-			Name: jobSecretsVolume,
-			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-				SecretName:  project.Spec.Secrets.SecretRef.Name,
-				DefaultMode: &mode,
-			}},
+			Name:         jobSecretsVolume,
+			VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: projections, DefaultMode: &mode}},
 		})
 		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: jobSecretsVolume, MountPath: jobContextMountPath + "/secrets", ReadOnly: true})
 		container.Args = append(container.Args, "--secrets-directory="+jobContextMountPath+"/secrets")
 	}
-	if project.Spec.Variables != nil {
+	if len(sources.variables) > 0 {
+		projections := make([]corev1.VolumeProjection, 0, len(sources.variables))
+		for _, source := range sources.variables {
+			projections = append(projections, corev1.VolumeProjection{ConfigMap: &corev1.ConfigMapProjection{LocalObjectReference: source}})
+		}
 		pod.Volumes = append(pod.Volumes, corev1.Volume{
-			Name: jobVariablesVolume,
-			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
-				LocalObjectReference: project.Spec.Variables.ConfigMapRef,
-				DefaultMode:          &mode,
-			}},
+			Name:         jobVariablesVolume,
+			VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: projections, DefaultMode: &mode}},
 		})
 		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: jobVariablesVolume, MountPath: jobContextMountPath + "/variables", ReadOnly: true})
 		container.Args = append(container.Args, "--variables-directory="+jobContextMountPath+"/variables")

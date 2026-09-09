@@ -38,6 +38,45 @@ func TestProjectAcceptsValueSources(t *testing.T) {
 	validateSample(t, crd, "actions_v1alpha1_project-values.yaml")
 }
 
+func TestProjectRepositoryValueSourcesContract(t *testing.T) {
+	crd, _ := loadCRD(t, "actions.kelos.dev_projects.yaml")
+	for _, test := range []struct {
+		name  string
+		entry map[string]any
+		valid bool
+	}{
+		{"secrets only", map[string]any{"name": "acme/app", "secrets": map[string]any{"secretRef": map[string]any{"name": "app-secrets"}}}, true},
+		{"variables only", map[string]any{"name": "acme/app", "variables": map[string]any{"configMapRef": map[string]any{"name": "app-variables"}}}, true},
+		{"missing sources", map[string]any{"name": "acme/app"}, false},
+		{"missing repository", map[string]any{"secrets": map[string]any{"secretRef": map[string]any{"name": "app-secrets"}}}, false},
+		{"invalid Secret reference", map[string]any{"name": "acme/app", "secrets": map[string]any{"secretRef": map[string]any{"name": "invalid/name"}}}, false},
+		{"empty ConfigMap reference", map[string]any{"name": "acme/app", "variables": map[string]any{"configMapRef": map[string]any{}}}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			object := loadSample(t, "actions_v1alpha1_project.yaml")
+			object["spec"].(map[string]any)["repositories"] = []any{test.entry}
+			if errs := validateObject(t, crd, object, nil); (len(errs) == 0) != test.valid {
+				t.Fatalf("validation = %v, want valid %t", errs.ToAggregate(), test.valid)
+			}
+		})
+	}
+	for _, name := range []string{"app", "acme/", "/app", "Acme/app", "acme/app/extra", "acme/.", "acme/..", "acme/app*"} {
+		object := loadSample(t, "actions_v1alpha1_project-values.yaml")
+		entry := object["spec"].(map[string]any)["repositories"].([]any)[0].(map[string]any)
+		entry["name"] = name
+		if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+			t.Fatalf("invalid repository name %q passed validation", name)
+		}
+	}
+	object := loadSample(t, "actions_v1alpha1_project-values.yaml")
+	spec := object["spec"].(map[string]any)
+	entry := spec["repositories"].([]any)[0]
+	spec["repositories"] = []any{entry, entry}
+	if errs := validateObject(t, crd, object, nil); len(errs) == 0 {
+		t.Fatal("duplicate repositories passed validation")
+	}
+}
+
 func TestWorkflowRunAcceptsCommitStatusErrorState(t *testing.T) {
 	crd, _ := loadCRD(t, "actions.kelos.dev_workflowruns.yaml")
 	object := loadSample(t, "actions_v1alpha1_workflowrun.yaml")
@@ -970,12 +1009,18 @@ func TestCRDConventions(t *testing.T) {
 
 			if tt.kind == "Project" {
 				secrets := spec.Properties["secrets"]
-				if !slices.Contains(secrets.Required, "secretRef") || len(secrets.XValidations) != 3 {
+				if !slices.Contains(secrets.Required, "secretRef") {
 					t.Errorf("spec.secrets schema = %#v", secrets)
 				}
 				variables := spec.Properties["variables"]
-				if !slices.Contains(variables.Required, "configMapRef") || len(variables.XValidations) != 3 {
+				if !slices.Contains(variables.Required, "configMapRef") {
 					t.Errorf("spec.variables schema = %#v", variables)
+				}
+				for _, reference := range []apiextensionsv1.JSONSchemaProps{secrets.Properties["secretRef"], variables.Properties["configMapRef"]} {
+					name := reference.Properties["name"]
+					if !slices.Contains(reference.Required, "name") || name.MinLength == nil || *name.MinLength != 1 || name.MaxLength == nil || *name.MaxLength != 253 || name.Pattern == "" {
+						t.Errorf("Project value reference schema = %#v", reference)
+					}
 				}
 			}
 			if tt.kind == "Runner" {

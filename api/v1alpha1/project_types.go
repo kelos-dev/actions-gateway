@@ -18,17 +18,25 @@ type ProjectSpec struct {
 	// +required
 	Source ProjectSource `json:"source"`
 
-	// Secrets selects the Secret whose data entries become available to
-	// workflows through the secrets context. The Secret must be in the Project
-	// namespace, and its keys use GitHub's canonical uppercase representation.
+	// Secrets selects defaults shared by every repository in the Project
+	// through the secrets context. The Secret must be in the Project namespace,
+	// and its keys use GitHub's canonical uppercase representation.
 	// +optional
 	Secrets *ProjectSecretSource `json:"secrets,omitempty"`
 
-	// Variables selects the ConfigMap whose data entries become available to
-	// workflows through the vars context. The ConfigMap must be in the Project
-	// namespace, and its keys use GitHub's canonical uppercase representation.
+	// Variables selects defaults shared by every repository in the Project
+	// through the vars context. The ConfigMap must be in the Project namespace,
+	// and its keys use GitHub's canonical uppercase representation.
 	// +optional
 	Variables *ProjectVariableSource `json:"variables,omitempty"`
+
+	// Repositories selects values available only to the named repository.
+	// Repository values override shared Project defaults with the same name.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=1000
+	// +optional
+	Repositories []ProjectRepositoryValues `json:"repositories,omitempty"`
 
 	// WorkflowDirectory is the repository-relative directory containing workflow
 	// files. The default keeps the files outside GitHub's native workflow path.
@@ -41,24 +49,48 @@ type ProjectSpec struct {
 	WorkflowDirectory string `json:"workflowDirectory,omitempty"`
 }
 
-// +kubebuilder:validation:XValidation:rule="size(self.secretRef.name) > 0",message="`secretRef.name` must be specified"
-// +kubebuilder:validation:XValidation:rule="size(self.secretRef.name) <= 253",message="`secretRef.name` must be no more than 253 characters"
-// +kubebuilder:validation:XValidation:rule="self.secretRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')",message="`secretRef.name` must be a DNS subdomain"
+// ProjectRepositoryValues selects namespace-local value sources for one repository.
+// +kubebuilder:validation:XValidation:rule="has(self.secrets) || has(self.variables)",message="at least one of secrets or variables must be specified"
+type ProjectRepositoryValues struct {
+	// Name is the lowercase owner/repository name. Matching ignores case.
+	// +kubebuilder:validation:MaxLength=201
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9_-]{0,99}/[a-z0-9._-]{1,100}$`
+	// +kubebuilder:validation:XValidation:rule="!self.endsWith('/.') && !self.endsWith('/..')",message="must identify a GitHub repository"
+	// +required
+	Name string `json:"name"`
+
+	// Secrets selects repository secrets, overriding matching shared Project secrets.
+	// +optional
+	Secrets *ProjectSecretSource `json:"secrets,omitempty"`
+
+	// Variables selects repository variables, overriding matching shared Project variables.
+	// +optional
+	Variables *ProjectVariableSource `json:"variables,omitempty"`
+}
+
 // ProjectSecretSource selects one Kubernetes Secret.
 type ProjectSecretSource struct {
 	// SecretRef identifies the Secret in the Project namespace.
 	// +required
-	SecretRef corev1.LocalObjectReference `json:"secretRef"`
+	SecretRef ProjectValueReference `json:"secretRef"`
 }
 
-// +kubebuilder:validation:XValidation:rule="size(self.configMapRef.name) > 0",message="`configMapRef.name` must be specified"
-// +kubebuilder:validation:XValidation:rule="size(self.configMapRef.name) <= 253",message="`configMapRef.name` must be no more than 253 characters"
-// +kubebuilder:validation:XValidation:rule="self.configMapRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')",message="`configMapRef.name` must be a DNS subdomain"
 // ProjectVariableSource selects one Kubernetes ConfigMap.
 type ProjectVariableSource struct {
 	// ConfigMapRef identifies the ConfigMap in the Project namespace.
 	// +required
-	ConfigMapRef corev1.LocalObjectReference `json:"configMapRef"`
+	ConfigMapRef ProjectValueReference `json:"configMapRef"`
+}
+
+// ProjectValueReference identifies a Secret or ConfigMap in the Project namespace.
+// +structType=atomic
+type ProjectValueReference struct {
+	// Name is the name of the referenced object.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$`
+	// +required
+	Name string `json:"name"`
 }
 
 // ProjectSource is a discriminated union of supported workflow sources.
@@ -117,7 +149,8 @@ type GitHubAppConfiguration struct {
 
 	// ForkPullRequests controls ordinary pull_request workflows whose code comes
 	// from a fork or Dependabot. Omit it to enable workflows with approval
-	// required, read-only token permissions, and Project secrets withheld.
+	// required, read-only token permissions, and shared Project and repository
+	// secrets withheld.
 	// +optional
 	ForkPullRequests *GitHubForkPullRequestPolicy `json:"forkPullRequests,omitempty"`
 }
@@ -141,7 +174,8 @@ type GitHubForkPullRequestPolicy struct {
 	// +optional
 	SendWriteTokens bool `json:"sendWriteTokens,omitempty"`
 
-	// SendSecrets makes the Project Secret available to fork pull request jobs.
+	// SendSecrets makes shared Project and repository secrets available to fork
+	// pull request jobs.
 	// +optional
 	SendSecrets bool `json:"sendSecrets,omitempty"`
 }

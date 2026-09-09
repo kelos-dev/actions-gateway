@@ -425,8 +425,8 @@ func TestRunnerBuildsJobWithProjectValues(t *testing.T) {
 	reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
 	project := &actionsv1alpha1.Project{
 		Spec: actionsv1alpha1.ProjectSpec{
-			Secrets:   &actionsv1alpha1.ProjectSecretSource{SecretRef: corev1.LocalObjectReference{Name: "project-secrets"}},
-			Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: corev1.LocalObjectReference{Name: "project-variables"}},
+			Secrets:   &actionsv1alpha1.ProjectSecretSource{SecretRef: actionsv1alpha1.ProjectValueReference{Name: "project-secrets"}},
+			Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: actionsv1alpha1.ProjectValueReference{Name: "project-variables"}},
 		},
 	}
 	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: runnerExecution("runner:test")}}
@@ -444,17 +444,17 @@ func TestRunnerBuildsJobWithProjectValues(t *testing.T) {
 		!slices.Contains(container.VolumeMounts, corev1.VolumeMount{Name: jobVariablesVolume, MountPath: jobContextMountPath + "/variables", ReadOnly: true}) {
 		t.Fatalf("runner volume mounts = %#v", container.VolumeMounts)
 	}
-	var secret *corev1.SecretVolumeSource
-	var variables *corev1.ConfigMapVolumeSource
+	var secret *corev1.SecretProjection
+	var variables *corev1.ConfigMapProjection
 	for _, volume := range job.Spec.Template.Spec.Volumes {
 		switch volume.Name {
 		case jobSecretsVolume:
-			secret = volume.Secret
+			secret = volume.Projected.Sources[0].Secret
 		case jobVariablesVolume:
-			variables = volume.ConfigMap
+			variables = volume.Projected.Sources[0].ConfigMap
 		}
 	}
-	if secret == nil || secret.SecretName != "project-secrets" {
+	if secret == nil || secret.Name != "project-secrets" {
 		t.Fatalf("secret volume = %#v", secret)
 	}
 	if variables == nil || variables.Name != "project-variables" {
@@ -466,8 +466,8 @@ func TestRunnerWithholdsProjectSecretsFromForkPullRequests(t *testing.T) {
 	scheme := runnerTestScheme(t)
 	reconciler := &RunnerReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
 	project := &actionsv1alpha1.Project{Spec: actionsv1alpha1.ProjectSpec{
-		Secrets:   &actionsv1alpha1.ProjectSecretSource{SecretRef: corev1.LocalObjectReference{Name: "project-secrets"}},
-		Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: corev1.LocalObjectReference{Name: "project-variables"}},
+		Secrets:   &actionsv1alpha1.ProjectSecretSource{SecretRef: actionsv1alpha1.ProjectValueReference{Name: "project-secrets"}},
+		Variables: &actionsv1alpha1.ProjectVariableSource{ConfigMapRef: actionsv1alpha1.ProjectValueReference{Name: "project-variables"}},
 	}}
 	run := &actionsv1alpha1.WorkflowRun{Spec: actionsv1alpha1.WorkflowRunSpec{ForkPullRequest: &actionsv1alpha1.WorkflowRunForkPullRequest{}}}
 	runnerObject := &actionsv1alpha1.Runner{Spec: actionsv1alpha1.RunnerSpec{Execution: runnerExecution("runner:test")}}

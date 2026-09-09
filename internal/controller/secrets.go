@@ -24,12 +24,17 @@ func secretValue(ctx context.Context, reader client.Reader, namespace string, se
 	return value, nil
 }
 
-func validateProjectSecretValues(ctx context.Context, reader client.Reader, project *actionsv1alpha1.Project) error {
-	if project.Spec.Secrets == nil {
-		return nil
+func validateProjectSecretValues(ctx context.Context, reader client.Reader, project *actionsv1alpha1.Project, sources []corev1.LocalObjectReference) error {
+	for _, source := range sources {
+		if err := validateProjectSecretSource(ctx, reader, project, source.Name); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+func validateProjectSecretSource(ctx context.Context, reader client.Reader, project *actionsv1alpha1.Project, secretName string) error {
 	secret := &corev1.Secret{}
-	secretName := project.Spec.Secrets.SecretRef.Name
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: project.Namespace, Name: secretName}, secret); err != nil {
 		return fmt.Errorf("Project %q: get Secret %q: %w", project.Name, secretName, err)
 	}
@@ -52,12 +57,17 @@ func validateProjectSecretValues(ctx context.Context, reader client.Reader, proj
 	return nil
 }
 
-func validateProjectVariableValues(ctx context.Context, reader client.Reader, project *actionsv1alpha1.Project) error {
-	if project.Spec.Variables == nil {
-		return nil
+func validateProjectVariableValues(ctx context.Context, reader client.Reader, project *actionsv1alpha1.Project, sources []corev1.LocalObjectReference) error {
+	for _, source := range sources {
+		if err := validateProjectVariableSource(ctx, reader, project, source.Name); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+func validateProjectVariableSource(ctx context.Context, reader client.Reader, project *actionsv1alpha1.Project, configMapName string) error {
 	configMap := &corev1.ConfigMap{}
-	configMapName := project.Spec.Variables.ConfigMapRef.Name
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: project.Namespace, Name: configMapName}, configMap); err != nil {
 		return fmt.Errorf("Project %q: get ConfigMap %q: %w", project.Name, configMapName, err)
 	}

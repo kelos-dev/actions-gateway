@@ -78,10 +78,11 @@ func (r *ProjectReconciler) validate(ctx context.Context, project *actionsv1alph
 	if _, err := secretValue(ctx, r.APIReader, project.Namespace, github.WebhookSecretRef); err != nil {
 		return "CredentialsUnavailable", err
 	}
-	if err := validateProjectSecretValues(ctx, r.APIReader, project); err != nil {
+	sources := allProjectValueSources(project)
+	if err := validateProjectSecretValues(ctx, r.APIReader, project, sources.secrets); err != nil {
 		return "ProjectValuesUnavailable", err
 	}
-	if err := validateProjectVariableValues(ctx, r.APIReader, project); err != nil {
+	if err := validateProjectVariableValues(ctx, r.APIReader, project, sources.variables); err != nil {
 		return "ProjectValuesUnavailable", err
 	}
 	return "", nil
@@ -136,13 +137,18 @@ func (r *ProjectReconciler) projectsForValueSource(ctx context.Context, object c
 	for index := range projects.Items {
 		project := &projects.Items[index]
 		matched := false
+		sources := allProjectValueSources(project)
 		switch object.GetObjectKind().GroupVersionKind() {
 		case corev1.SchemeGroupVersion.WithKind("Secret"):
 			github := project.Spec.Source.GitHub
 			matched = github != nil && (github.PrivateKeySecretRef.Name == object.GetName() || github.WebhookSecretRef.Name == object.GetName())
-			matched = matched || project.Spec.Secrets != nil && project.Spec.Secrets.SecretRef.Name == object.GetName()
+			for _, source := range sources.secrets {
+				matched = matched || source.Name == object.GetName()
+			}
 		case corev1.SchemeGroupVersion.WithKind("ConfigMap"):
-			matched = project.Spec.Variables != nil && project.Spec.Variables.ConfigMapRef.Name == object.GetName()
+			for _, source := range sources.variables {
+				matched = matched || source.Name == object.GetName()
+			}
 		}
 		if matched {
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(project)})

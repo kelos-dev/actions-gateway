@@ -53,36 +53,98 @@ spec:
             description: ProjectSpec describes the workflow source for an Open Actions
               Project.
             properties:
+              repositories:
+                description: |-
+                  Repositories selects values available only to the named repository.
+                  Repository values override shared Project defaults with the same name.
+                items:
+                  description: ProjectRepositoryValues selects namespace-local value
+                    sources for one repository.
+                  properties:
+                    name:
+                      description: Name is the lowercase owner/repository name. Matching
+                        ignores case.
+                      maxLength: 201
+                      pattern: ^[a-z0-9][a-z0-9_-]{0,99}/[a-z0-9._-]{1,100}$
+                      type: string
+                      x-kubernetes-validations:
+                      - message: must identify a GitHub repository
+                        rule: '!self.endsWith(''/.'') && !self.endsWith(''/..'')'
+                    secrets:
+                      description: Secrets selects repository secrets, overriding
+                        matching shared Project secrets.
+                      properties:
+                        secretRef:
+                          description: SecretRef identifies the Secret in the Project
+                            namespace.
+                          properties:
+                            name:
+                              description: Name is the name of the referenced object.
+                              maxLength: 253
+                              minLength: 1
+                              pattern: ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$
+                              type: string
+                          required:
+                          - name
+                          type: object
+                          x-kubernetes-map-type: atomic
+                      required:
+                      - secretRef
+                      type: object
+                    variables:
+                      description: Variables selects repository variables, overriding
+                        matching shared Project variables.
+                      properties:
+                        configMapRef:
+                          description: ConfigMapRef identifies the ConfigMap in the
+                            Project namespace.
+                          properties:
+                            name:
+                              description: Name is the name of the referenced object.
+                              maxLength: 253
+                              minLength: 1
+                              pattern: ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$
+                              type: string
+                          required:
+                          - name
+                          type: object
+                          x-kubernetes-map-type: atomic
+                      required:
+                      - configMapRef
+                      type: object
+                  required:
+                  - name
+                  type: object
+                  x-kubernetes-validations:
+                  - message: at least one of secrets or variables must be specified
+                    rule: has(self.secrets) || has(self.variables)
+                maxItems: 1000
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               secrets:
                 description: |-
-                  Secrets selects the Secret whose data entries become available to
-                  workflows through the secrets context. The Secret must be in the Project
-                  namespace, and its keys use GitHub's canonical uppercase representation.
+                  Secrets selects defaults shared by every repository in the Project
+                  through the secrets context. The Secret must be in the Project namespace,
+                  and its keys use GitHub's canonical uppercase representation.
                 properties:
                   secretRef:
                     description: SecretRef identifies the Secret in the Project namespace.
                     properties:
                       name:
-                        default: ""
-                        description: |-
-                          Name of the referent.
-                          This field is effectively required, but due to backwards compatibility is
-                          allowed to be empty. Instances of this type with an empty value here are
-                          almost certainly wrong.
-                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        description: Name is the name of the referenced object.
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$
                         type: string
+                    required:
+                    - name
                     type: object
                     x-kubernetes-map-type: atomic
                 required:
                 - secretRef
                 type: object
-                x-kubernetes-validations:
-                - message: '`secretRef.name` must be specified'
-                  rule: size(self.secretRef.name) > 0
-                - message: '`secretRef.name` must be no more than 253 characters'
-                  rule: size(self.secretRef.name) <= 253
-                - message: '`secretRef.name` must be a DNS subdomain'
-                  rule: self.secretRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')
               source:
                 description: Source selects and configures the external workflow source.
                 properties:
@@ -102,7 +164,8 @@ spec:
                         description: |-
                           ForkPullRequests controls ordinary pull_request workflows whose code comes
                           from a fork or Dependabot. Omit it to enable workflows with approval
-                          required, read-only token permissions, and Project secrets withheld.
+                          required, read-only token permissions, and shared Project and repository
+                          secrets withheld.
                         properties:
                           enabled:
                             default: true
@@ -116,8 +179,9 @@ spec:
                               WorkflowRun for its pinned pull request head revision.
                             type: boolean
                           sendSecrets:
-                            description: SendSecrets makes the Project Secret available
-                              to fork pull request jobs.
+                            description: |-
+                              SendSecrets makes shared Project and repository secrets available to fork
+                              pull request jobs.
                             type: boolean
                           sendWriteTokens:
                             description: |-
@@ -241,35 +305,27 @@ spec:
                   rule: self.type == oldSelf.type
               variables:
                 description: |-
-                  Variables selects the ConfigMap whose data entries become available to
-                  workflows through the vars context. The ConfigMap must be in the Project
-                  namespace, and its keys use GitHub's canonical uppercase representation.
+                  Variables selects defaults shared by every repository in the Project
+                  through the vars context. The ConfigMap must be in the Project namespace,
+                  and its keys use GitHub's canonical uppercase representation.
                 properties:
                   configMapRef:
                     description: ConfigMapRef identifies the ConfigMap in the Project
                       namespace.
                     properties:
                       name:
-                        default: ""
-                        description: |-
-                          Name of the referent.
-                          This field is effectively required, but due to backwards compatibility is
-                          allowed to be empty. Instances of this type with an empty value here are
-                          almost certainly wrong.
-                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        description: Name is the name of the referenced object.
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$
                         type: string
+                    required:
+                    - name
                     type: object
                     x-kubernetes-map-type: atomic
                 required:
                 - configMapRef
                 type: object
-                x-kubernetes-validations:
-                - message: '`configMapRef.name` must be specified'
-                  rule: size(self.configMapRef.name) > 0
-                - message: '`configMapRef.name` must be no more than 253 characters'
-                  rule: size(self.configMapRef.name) <= 253
-                - message: '`configMapRef.name` must be a DNS subdomain'
-                  rule: self.configMapRef.name.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$')
               workflowDirectory:
                 default: .open-actions/workflows
                 description: |-
