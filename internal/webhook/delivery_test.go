@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -55,7 +56,7 @@ func TestWebhookReplayIDUsesSignedBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	stored := &corev1.ConfigMap{}
-	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}
+	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(string(project.UID), body)}
 	if err := clusterClient.Get(context.Background(), key, stored); err != nil {
 		t.Fatal(err)
 	}
@@ -82,6 +83,159 @@ func TestWebhookReplayIDUsesSignedBody(t *testing.T) {
 	}
 }
 
+func TestEnqueueDeliveryReusesProjectOwnedBodyAddressedDelivery(t *testing.T) {
+	project := &actionsv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "team", UID: "first-uid"},
+	}
+	other := project.DeepCopy()
+	other.Name, other.UID = "second", "second-uid"
+	body := []byte(`{"repository":{"id":1,"name":"example","owner":{"login":"acme"}}}`)
+	event := &payload{}
+	if err := json.Unmarshal(body, event); err != nil {
+		t.Fatal(err)
+	}
+	normalized := normalizedEvent{Name: "push", SHA: strings.Repeat("a", 40), Ref: "refs/heads/main"}
+	name := "delivery-" + webhookReplayID(body)
+	queued := queuedDelivery{
+		ProjectName: project.Name, ProjectUID: string(project.UID),
+		Repository: deliveryRepository{ID: 1, Owner: "acme", Name: "example"}, Event: normalized,
+		EventSnapshot: eventSnapshotName(name), ReplayID: webhookReplayID(body), DeliveryID: "original",
+	}
+	data, err := json.Marshal(queued)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := true
+	stored := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: project.Namespace, UID: "delivery-uid", Labels: map[string]string{deliveryLabel: "true"}, OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: actionsv1alpha1.GroupVersion.String(), Kind: "Project", Name: project.Name, UID: project.UID, Controller: &controller,
+		}}},
+		Data: map[string]string{deliveryDataKey: string(data)},
+	}
+	clusterClient := fake.NewClientBuilder().WithScheme(deliveryTestScheme(t)).WithObjects(project, other, stored).Build()
+	handler := &GitHubHandler{Client: clusterClient, APIReader: clusterClient}
+	for _, target := range []*actionsv1alpha1.Project{project, other} {
+		if err := handler.enqueueDelivery(context.Background(), target, event, normalized, "retry", body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deliveries := &corev1.ConfigMapList{}
+	if err := clusterClient.List(context.Background(), deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries.Items) != 2 {
+		t.Fatalf("deliveries = %d, want 2", len(deliveries.Items))
+	}
+	if err := clusterClient.Get(context.Background(), client.ObjectKeyFromObject(stored), stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Data[deliveryDataKey] != string(data) {
+		t.Fatalf("stored delivery changed: %s", stored.Data[deliveryDataKey])
+	}
+	second := &corev1.ConfigMap{}
+	if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: other.Namespace, Name: webhookDeliveryName(string(other.UID), body)}, second); err != nil {
+		t.Fatal(err)
+	}
+	for _, delivery := range []*corev1.ConfigMap{stored, second} {
+		snapshot := &corev1.Secret{}
+		if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: delivery.Namespace, Name: eventSnapshotName(delivery.Name)}, snapshot); err != nil {
+			t.Fatal(err)
+		}
+		if !metav1.IsControlledBy(snapshot, delivery) || !bytes.Equal(snapshot.Data[eventsnapshot.DataKey], body) {
+			t.Fatalf("event snapshot = %#v", snapshot)
+		}
+	}
+}
+
+func TestSharedInstallationProjectsDiscoverWorkflowsIndependently(t *testing.T) {
+	for _, sharedDirectory := range []bool{false, true} {
+		t.Run(fmt.Sprintf("shared directory %t", sharedDirectory), func(t *testing.T) {
+			workflowData := []byte("on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n")
+			var directories []string
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.URL.Path == "/app/installations/2/access_tokens" {
+					fmt.Fprint(writer, `{"token":"installation-token"}`)
+					return
+				}
+				const prefix = "/repos/acme/example/contents/"
+				if strings.HasPrefix(request.URL.Path, prefix) {
+					path := strings.TrimPrefix(request.URL.Path, prefix)
+					if strings.HasSuffix(path, "/ci.yaml") {
+						fmt.Fprintf(writer, `{"encoding":"base64","content":%q}`, base64.StdEncoding.EncodeToString(workflowData))
+					} else {
+						directories = append(directories, path)
+						fmt.Fprintf(writer, `[{"path":%q,"type":"file"}]`, path+"/ci.yaml")
+					}
+					return
+				}
+				http.NotFound(writer, request)
+			}))
+			defer server.Close()
+			clusterClient, reconciler, handler, first := newPullRequestDeliveryTest(t, server, time.Now())
+			first.Spec.WorkflowDirectory = ".open-actions/build"
+			if err := clusterClient.Update(context.Background(), first); err != nil {
+				t.Fatal(err)
+			}
+			second := first.DeepCopy()
+			second.Name, second.UID, second.ResourceVersion = "second", "second-uid", ""
+			if !sharedDirectory {
+				second.Spec.WorkflowDirectory = ".open-actions/deploy"
+			}
+			if err := clusterClient.Create(context.Background(), second); err != nil {
+				t.Fatal(err)
+			}
+			body := []byte(`{"after":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"refs/heads/main","installation":{"id":2},"repository":{"id":1,"name":"example","owner":{"login":"acme"}}}`)
+			event := &payload{}
+			if err := json.Unmarshal(body, event); err != nil {
+				t.Fatal(err)
+			}
+			normalized, supported, err := normalize("push", event)
+			if err != nil || !supported {
+				t.Fatalf("normalize() supported %t, error %v", supported, err)
+			}
+			for _, deliveryID := range []string{"original", "retry"} {
+				for _, project := range []*actionsv1alpha1.Project{first, second} {
+					if err := handler.enqueueDelivery(context.Background(), project, event, normalized, deliveryID, body); err != nil {
+						t.Fatal(err)
+					}
+					key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(string(project.UID), body)}
+					if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+						t.Fatal(err)
+					}
+					stored := &corev1.ConfigMap{}
+					if err := clusterClient.Get(context.Background(), key, stored); err != nil {
+						t.Fatal(err)
+					}
+					if stored.Data[deliveryStateKey] != deliveryStateCompleted || stored.Data[deliveryRunCountKey] != "1" {
+						t.Fatalf("Project %s delivery = %#v", project.Name, stored.Data)
+					}
+				}
+			}
+			if !slices.Equal(directories, []string{first.Spec.WorkflowDirectory, second.Spec.WorkflowDirectory}) {
+				t.Fatalf("discovered directories = %v", directories)
+			}
+			runs := &actionsv1alpha1.WorkflowRunList{}
+			if err := clusterClient.List(context.Background(), runs); err != nil {
+				t.Fatal(err)
+			}
+			if len(runs.Items) != 2 {
+				t.Fatalf("WorkflowRuns = %d, want 2", len(runs.Items))
+			}
+			for _, project := range []*actionsv1alpha1.Project{first, second} {
+				run := &actionsv1alpha1.WorkflowRun{}
+				path := project.Spec.WorkflowDirectory + "/ci.yaml"
+				key := client.ObjectKey{Namespace: project.Namespace, Name: workflowRunName(path, string(project.UID), webhookReplayID(body))}
+				if err := clusterClient.Get(context.Background(), key, run); err != nil {
+					t.Fatal(err)
+				}
+				if run.Spec.ProjectRef.Name != project.Name || run.Spec.WorkflowPath != path || run.Annotations[eventsnapshot.Annotation] != eventSnapshotName(webhookDeliveryName(string(project.UID), body)) {
+					t.Fatalf("WorkflowRun = %#v", run)
+				}
+			}
+		})
+	}
+}
+
 func TestEnqueueDeliveryStoresBoundedMetadataOnce(t *testing.T) {
 	scheme := deliveryTestScheme(t)
 	project := &actionsv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "default", UID: "project-uid"}}
@@ -105,7 +259,7 @@ func TestEnqueueDeliveryStoresBoundedMetadataOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	stored := &corev1.ConfigMap{}
-	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(signedBody)}
+	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(string(project.UID), signedBody)}
 	if err := clusterClient.Get(context.Background(), key, stored); err != nil {
 		t.Fatal(err)
 	}
@@ -581,7 +735,7 @@ func TestDeliveryCachesWorkflowsAcrossEventsAtAnImmutableRevision(t *testing.T) 
 		if err := handler.enqueueDelivery(context.Background(), project, event, normalized, name, body); err != nil {
 			t.Fatal(err)
 		}
-		return client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}
+		return client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(string(project.UID), body)}
 	}
 	reconcile := func(key client.ObjectKey) {
 		t.Helper()
@@ -796,7 +950,7 @@ func TestForkUpdatesCreateIndependentTrustedTargetRuns(t *testing.T) {
 		if err := handler.enqueueDelivery(context.Background(), project, event, normalized, "delivery-"+headSHA[:8], body); err != nil {
 			t.Fatal(err)
 		}
-		return client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}
+		return client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(string(project.UID), body)}
 	}
 
 	for _, update := range []struct {
@@ -857,7 +1011,7 @@ func TestDeliveryFinishesWhenEventRevisionIsUnavailable(t *testing.T) {
 	if err := handler.enqueueDelivery(context.Background(), project, event, normalized, "delivery", body); err != nil {
 		t.Fatal(err)
 	}
-	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}
+	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(string(project.UID), body)}
 	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
 		t.Fatal(err)
 	}
@@ -905,7 +1059,7 @@ func TestDeliveryDoesNotCountRunsBeforeTargetRevisionFailure(t *testing.T) {
 	if err := handler.enqueueDelivery(context.Background(), project, event, normalized, "delivery", body); err != nil {
 		t.Fatal(err)
 	}
-	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}
+	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(string(project.UID), body)}
 	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
 		t.Fatal(err)
 	}
@@ -1043,7 +1197,7 @@ func enqueuePullRequestDelivery(t *testing.T, handler *GitHubHandler, clusterCli
 	if err := handler.enqueueDelivery(context.Background(), project, event, normalized, "delivery", body); err != nil {
 		t.Fatal(err)
 	}
-	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}
+	key := client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(string(project.UID), body)}
 	object := &corev1.ConfigMap{}
 	if err := clusterClient.Get(context.Background(), key, object); err != nil {
 		t.Fatal(err)

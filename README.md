@@ -107,6 +107,10 @@ unless fork code belongs to the installation's trust boundary.
 
 ### 4. Create a Project and runner
 
+Multiple Projects can share this GitHub App installation. Each Project processes
+events using its own workflow directory and runners; see the
+[shared installation sample](config/samples/actions_v1alpha1_projects-shared-installation.yaml).
+
 Set these values for the GitHub App you just installed:
 
 ```console

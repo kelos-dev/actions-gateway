@@ -8,7 +8,6 @@ import (
 	"encoding/pem"
 	"strings"
 	"testing"
-	"time"
 
 	actionsv1alpha1 "github.com/kelos-dev/open-actions/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -17,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -131,32 +131,70 @@ func TestProjectValueSourceChangesEnqueueReferencingProjects(t *testing.T) {
 	}
 }
 
-func TestEarlierProjectOwnsInstallationAcrossNamespaces(t *testing.T) {
+func TestProjectsShareGitHubAppInstallation(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	project := &actionsv1alpha1.Project{
-		ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "first", UID: types.UID("first"), CreationTimestamp: metav1.NewTime(time.Unix(100, 0))},
-		Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{
-			Type:   actionsv1alpha1.SourceTypeGitHub,
-			GitHub: &actionsv1alpha1.GitHubAppConfiguration{AppID: 1, InstallationID: 3},
-		}},
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
 	}
-	other := &actionsv1alpha1.Project{
-		ObjectMeta: metav1.ObjectMeta{Name: "second", Namespace: "second", UID: types.UID("second"), CreationTimestamp: metav1.NewTime(time.Unix(200, 0))},
-		Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{
-			Type:   actionsv1alpha1.SourceTypeGitHub,
-			GitHub: &actionsv1alpha1.GitHubAppConfiguration{AppID: 2, InstallationID: 3},
-		}},
-	}
-	reconciler := &ProjectReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(project, other).Build()}
-
-	owner, err := reconciler.installationOwner(context.Background(), other)
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if owner.UID != project.UID {
-		t.Fatalf("installation owner = %s/%s, want %s/%s", owner.Namespace, owner.Name, project.Namespace, project.Name)
+	credential := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: "team"},
+		Data: map[string][]byte{
+			"private-key":    pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}),
+			"webhook-secret": []byte("secret"),
+		},
+	}
+	otherCredential := credential.DeepCopy()
+	otherCredential.Namespace = "other-team"
+	projects := []*actionsv1alpha1.Project{}
+	objects := []client.Object{credential, otherCredential}
+	for _, key := range []client.ObjectKey{
+		{Namespace: "team", Name: "first"},
+		{Namespace: "team", Name: "second"},
+		{Namespace: "other-team", Name: "first"},
+	} {
+		project := &actionsv1alpha1.Project{
+			ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, UID: types.UID(key.String()), Generation: 1},
+			Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{
+				Type: actionsv1alpha1.SourceTypeGitHub,
+				GitHub: &actionsv1alpha1.GitHubAppConfiguration{
+					AppID: 1, InstallationID: 2,
+					PrivateKeySecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "private-key"},
+					WebhookSecretRef:    corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "github"}, Key: "webhook-secret"},
+				},
+			}},
+		}
+		projects = append(projects, project)
+		objects = append(objects, project)
+	}
+	invalid := projects[0].DeepCopy()
+	invalid.Name, invalid.UID = "invalid", "invalid-uid"
+	invalid.Spec.Source.GitHub.PrivateKeySecretRef.Name = "missing"
+	objects = append(objects, invalid)
+	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&actionsv1alpha1.Project{}).WithObjects(objects...).Build()
+	reconciler := &ProjectReconciler{Client: clusterClient, APIReader: clusterClient}
+	for _, project := range append(projects, invalid) {
+		key := client.ObjectKeyFromObject(project)
+		if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatal(err)
+		}
+		stored := &actionsv1alpha1.Project{}
+		if err := clusterClient.Get(context.Background(), key, stored); err != nil {
+			t.Fatal(err)
+		}
+		wantStatus, wantReason := metav1.ConditionTrue, "ConfigurationValid"
+		if project == invalid {
+			wantStatus, wantReason = metav1.ConditionFalse, "CredentialsUnavailable"
+		}
+		configured := meta.FindStatusCondition(stored.Status.Conditions, actionsv1alpha1.ProjectConditionConfigured)
+		if configured == nil || configured.Status != wantStatus || configured.Reason != wantReason || configured.ObservedGeneration != project.Generation {
+			t.Fatalf("Project %s configured condition = %#v", key, configured)
+		}
 	}
 }

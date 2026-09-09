@@ -206,14 +206,16 @@ func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 
-	project, webhookSecret, err := h.projectForInstallation(request.Context(), parsed.Installation.ID)
-	if err != nil {
-		metricResult = "error"
-		h.Logger.Error("failed to resolve project for webhook", "installation_id", parsed.Installation.ID, "error", err)
-		http.Error(writer, "project unavailable", http.StatusServiceUnavailable)
-		return
+	projects, projectErr := h.projectsForInstallation(request.Context(), parsed.Installation.ID, body, request.Header.Get("X-Hub-Signature-256"))
+	if projectErr != nil {
+		h.Logger.Error("failed to resolve projects for webhook", "installation_id", parsed.Installation.ID, "error", projectErr)
 	}
-	if !validSignature(body, webhookSecret, request.Header.Get("X-Hub-Signature-256")) {
+	if len(projects) == 0 {
+		if projectErr != nil {
+			metricResult = "error"
+			http.Error(writer, "project unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(writer, "invalid webhook signature", http.StatusUnauthorized)
 		return
 	}
@@ -222,22 +224,37 @@ func (h *GitHubHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if !supported {
-		metricResult = "ignored"
-		writeJSON(writer, http.StatusAccepted, map[string]any{"accepted": true, "queued": false})
+	var enqueueErr error
+	if supported {
+		for _, project := range projects {
+			if err := h.enqueueDelivery(request.Context(), project, parsed, normalized, deliveryID, body); err != nil {
+				enqueueErr = errors.Join(enqueueErr, fmt.Errorf("enqueue webhook for Project %q in namespace %q: %w", project.Name, project.Namespace, err))
+			}
+		}
+	}
+	if enqueueErr != nil {
+		h.Logger.Error("failed to enqueue GitHub webhook", "delivery_id", deliveryID, "event", eventName, "error", enqueueErr)
+	}
+	if projectErr != nil {
+		metricResult = "error"
+		http.Error(writer, "project unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	if err := h.enqueueDelivery(request.Context(), project, parsed, normalized, deliveryID, body); err != nil {
+	if enqueueErr != nil {
 		metricResult = "error"
-		h.Logger.Error("failed to enqueue GitHub webhook", "delivery_id", deliveryID, "event", eventName, "error", err)
-		if apierrors.IsConflict(err) {
+		if apierrors.IsConflict(enqueueErr) {
 			http.Error(writer, "webhook replay conflict", http.StatusConflict)
 			return
 		}
 		http.Error(writer, "enqueue webhook delivery failed", http.StatusInternalServerError)
 		return
 	}
-	h.Logger.Info("accepted GitHub webhook", "delivery_id", deliveryID, "event", eventName)
+	if !supported {
+		metricResult = "ignored"
+		writeJSON(writer, http.StatusAccepted, map[string]any{"accepted": true, "queued": false})
+		return
+	}
+	h.Logger.Info("accepted GitHub webhook", "delivery_id", deliveryID, "event", eventName, "projects", len(projects))
 	metricResult = "accepted"
 	writeJSON(writer, http.StatusAccepted, map[string]any{"accepted": true, "queued": true})
 }
@@ -249,29 +266,35 @@ func (h *GitHubHandler) now() time.Time {
 	return time.Now()
 }
 
-func (h *GitHubHandler) projectForInstallation(ctx context.Context, installationID int64) (*actionsv1alpha1.Project, []byte, error) {
+func (h *GitHubHandler) projectsForInstallation(ctx context.Context, installationID int64, body []byte, signature string) ([]*actionsv1alpha1.Project, error) {
 	projects := &actionsv1alpha1.ProjectList{}
 	if err := h.APIReader.List(ctx, projects); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	matches := []*actionsv1alpha1.Project{}
+	configuredProjects := 0
+	var secretErr error
 	for index := range projects.Items {
 		project := &projects.Items[index]
+		github := project.Spec.Source.GitHub
 		configured := meta.FindStatusCondition(project.Status.Conditions, actionsv1alpha1.ProjectConditionConfigured)
-		if project.Spec.Source.GitHub.InstallationID == installationID && configured != nil && configured.Status == metav1.ConditionTrue && configured.ObservedGeneration == project.Generation {
+		if github == nil || github.InstallationID != installationID || configured == nil || configured.Status != metav1.ConditionTrue || configured.ObservedGeneration != project.Generation {
+			continue
+		}
+		configuredProjects++
+		webhookSecret, err := readSecretValue(ctx, h.APIReader, project.Namespace, github.WebhookSecretRef)
+		if err != nil {
+			secretErr = errors.Join(secretErr, fmt.Errorf("read webhook secret for Project %q in namespace %q: %w", project.Name, project.Namespace, err))
+			continue
+		}
+		if validSignature(body, webhookSecret, signature) {
 			matches = append(matches, project)
 		}
 	}
-	if len(matches) != 1 {
-		return nil, nil, fmt.Errorf("installation %d matched %d projects", installationID, len(matches))
+	if configuredProjects == 0 {
+		return nil, fmt.Errorf("installation %d has no configured Projects", installationID)
 	}
-	project := matches[0]
-	github := project.Spec.Source.GitHub
-	webhookSecret, err := readSecretValue(ctx, h.APIReader, project.Namespace, github.WebhookSecretRef)
-	if err != nil {
-		return nil, nil, err
-	}
-	return project, webhookSecret, nil
+	return matches, secretErr
 }
 
 func normalize(eventName string, event *payload) (normalizedEvent, bool, error) {

@@ -34,13 +34,7 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, request ctrl.Request)
 	status := metav1.ConditionTrue
 	reason := "ConfigurationValid"
 	message := "Referenced credentials and workflow values are present and locally valid"
-	if owner, err := r.installationOwner(ctx, project); err != nil {
-		return ctrl.Result{}, err
-	} else if owner.UID != project.UID {
-		status = metav1.ConditionFalse
-		reason = "DuplicateInstallation"
-		message = fmt.Sprintf("Project %q in namespace %q owns this GitHub App installation", owner.Name, owner.Namespace)
-	} else if invalidReason, err := r.validate(ctx, project); err != nil {
+	if invalidReason, err := r.validate(ctx, project); err != nil {
 		status = metav1.ConditionFalse
 		reason = invalidReason
 		message = err.Error()
@@ -87,41 +81,9 @@ func (r *ProjectReconciler) validate(ctx context.Context, project *actionsv1alph
 	return "", nil
 }
 
-func (r *ProjectReconciler) installationOwner(ctx context.Context, project *actionsv1alpha1.Project) (*actionsv1alpha1.Project, error) {
-	projects := &actionsv1alpha1.ProjectList{}
-	if err := r.List(ctx, projects); err != nil {
-		return nil, err
-	}
-	var owner *actionsv1alpha1.Project
-	for index := range projects.Items {
-		candidate := &projects.Items[index]
-		if candidate.Spec.Source.GitHub.InstallationID == project.Spec.Source.GitHub.InstallationID && (owner == nil || projectPrecedes(candidate, owner)) {
-			owner = candidate
-		}
-	}
-	if owner == nil {
-		return nil, fmt.Errorf("GitHub App installation %d has no Project owner", project.Spec.Source.GitHub.InstallationID)
-	}
-	return owner, nil
-}
-
-func projectPrecedes(left, right *actionsv1alpha1.Project) bool {
-	if !left.CreationTimestamp.Equal(&right.CreationTimestamp) {
-		return left.CreationTimestamp.Before(&right.CreationTimestamp)
-	}
-	if left.Namespace != right.Namespace {
-		return left.Namespace < right.Namespace
-	}
-	if left.Name != right.Name {
-		return left.Name < right.Name
-	}
-	return left.UID < right.UID
-}
-
 func (r *ProjectReconciler) SetupWithManager(manager ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(manager).
 		For(&actionsv1alpha1.Project{}).
-		Watches(&actionsv1alpha1.Project{}, handler.EnqueueRequestsFromMapFunc(r.projectsForInstallation)).
 		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.projectsForValueSource)).
 		WatchesMetadata(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.projectsForValueSource)).
 		Complete(r)
@@ -146,25 +108,6 @@ func (r *ProjectReconciler) projectsForValueSource(ctx context.Context, object c
 		}
 		if matched {
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(project)})
-		}
-	}
-	return requests
-}
-
-func (r *ProjectReconciler) projectsForInstallation(ctx context.Context, object client.Object) []reconcile.Request {
-	project, ok := object.(*actionsv1alpha1.Project)
-	if !ok || project.Spec.Source.GitHub == nil {
-		return nil
-	}
-	projects := &actionsv1alpha1.ProjectList{}
-	if err := r.List(ctx, projects); err != nil {
-		return nil
-	}
-	requests := []reconcile.Request{}
-	for index := range projects.Items {
-		candidate := &projects.Items[index]
-		if candidate.Spec.Source.GitHub != nil && candidate.Spec.Source.GitHub.InstallationID == project.Spec.Source.GitHub.InstallationID {
-			requests = append(requests, requestFor(candidate))
 		}
 	}
 	return requests

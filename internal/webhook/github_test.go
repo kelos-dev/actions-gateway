@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -23,14 +24,14 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func TestValidSignature(t *testing.T) {
-	body := []byte(`{"zen":"Keep it logically awesome."}`)
-	secret := []byte("secret")
-	digest := hmac.New(sha256.New, secret)
-	digest.Write(body)
-	signature := "sha256=" + hex.EncodeToString(digest.Sum(nil))
+	// GitHub publishes this test vector at https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries.
+	body := []byte("Hello, World!")
+	secret := []byte("It's a Secret to Everybody")
+	signature := "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17"
 	if !validSignature(body, secret, signature) {
 		t.Fatal("valid signature was rejected")
 	}
@@ -61,44 +62,127 @@ func TestNormalizePreservesWebhookActor(t *testing.T) {
 	}
 }
 
-func TestProjectForInstallationUsesConfiguredOwner(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := actionsv1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	githubConfiguration := &actionsv1alpha1.GitHubAppConfiguration{
-		InstallationID: 42,
-		WebhookSecretRef: corev1.SecretKeySelector{
-			LocalObjectReference: corev1.LocalObjectReference{Name: "github"},
-			Key:                  "webhook-secret",
-		},
-	}
-	owner := &actionsv1alpha1.Project{
-		ObjectMeta: metav1.ObjectMeta{Name: "owner", Namespace: "trusted", Generation: 1},
-		Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{
-			Type: actionsv1alpha1.SourceTypeGitHub, GitHub: githubConfiguration.DeepCopy(),
-		}},
-		Status: actionsv1alpha1.ProjectStatus{Conditions: []metav1.Condition{{
-			Type: actionsv1alpha1.ProjectConditionConfigured, Status: metav1.ConditionTrue, ObservedGeneration: 1,
-		}}},
-	}
-	duplicate := owner.DeepCopy()
-	duplicate.Name = "duplicate"
-	duplicate.Namespace = "untrusted"
-	duplicate.Status.Conditions[0].Status = metav1.ConditionFalse
-	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "github", Namespace: owner.Namespace}, Data: map[string][]byte{"webhook-secret": []byte("secret")}}
-	clusterClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(owner, duplicate, secret).Build()
-	handler := &GitHubHandler{Client: clusterClient, APIReader: clusterClient}
-
-	selected, webhookSecret, err := handler.projectForInstallation(context.Background(), 42)
+func TestGitHubHandlerDeliversToProjectsSharingInstallation(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("testdata", "github", "push.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if selected.Namespace != owner.Namespace || selected.Name != owner.Name || string(webhookSecret) != "secret" {
-		t.Fatalf("selected project = %s/%s", selected.Namespace, selected.Name)
+	for _, tt := range []struct {
+		name             string
+		namespace        string
+		mutate           func(*actionsv1alpha1.Project, *corev1.Secret)
+		invalidSignature bool
+		missingSecret    bool
+		failCreate       bool
+		wantStatus       int
+		wantProjects     int
+	}{
+		{name: "same namespace", namespace: "team", wantStatus: http.StatusAccepted, wantProjects: 2},
+		{name: "different namespaces", namespace: "other-team", wantStatus: http.StatusAccepted, wantProjects: 2},
+		{name: "unconfigured project", mutate: func(project *actionsv1alpha1.Project, _ *corev1.Secret) {
+			project.Status.Conditions[0].Status = metav1.ConditionFalse
+		}, wantStatus: http.StatusAccepted, wantProjects: 1},
+		{name: "missing condition", mutate: func(project *actionsv1alpha1.Project, _ *corev1.Secret) { project.Status.Conditions = nil }, wantStatus: http.StatusAccepted, wantProjects: 1},
+		{name: "stale configuration", mutate: func(project *actionsv1alpha1.Project, _ *corev1.Secret) { project.Generation++ }, wantStatus: http.StatusAccepted, wantProjects: 1},
+		{name: "other installation", mutate: func(project *actionsv1alpha1.Project, _ *corev1.Secret) { project.Spec.Source.GitHub.InstallationID++ }, wantStatus: http.StatusAccepted, wantProjects: 1},
+		{name: "different webhook secret", mutate: func(_ *actionsv1alpha1.Project, secret *corev1.Secret) {
+			secret.Data["webhook-secret"] = []byte("different")
+		}, wantStatus: http.StatusAccepted, wantProjects: 1},
+		{name: "invalid signature", invalidSignature: true, wantStatus: http.StatusUnauthorized},
+		{name: "unavailable secret", missingSecret: true, wantStatus: http.StatusServiceUnavailable, wantProjects: 1},
+		{name: "partial enqueue failure", failCreate: true, wantStatus: http.StatusInternalServerError, wantProjects: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			first := &actionsv1alpha1.Project{
+				ObjectMeta: metav1.ObjectMeta{Name: "first", Namespace: "team", UID: "first-uid", Generation: 1},
+				Spec: actionsv1alpha1.ProjectSpec{Source: actionsv1alpha1.ProjectSource{Type: actionsv1alpha1.SourceTypeGitHub, GitHub: &actionsv1alpha1.GitHubAppConfiguration{
+					AppID: 1, InstallationID: 2002,
+					WebhookSecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "first-github"}, Key: "webhook-secret"},
+				}}},
+				Status: actionsv1alpha1.ProjectStatus{Conditions: []metav1.Condition{{Type: actionsv1alpha1.ProjectConditionConfigured, Status: metav1.ConditionTrue, ObservedGeneration: 1}}},
+			}
+			second := first.DeepCopy()
+			second.Name, second.UID = "second", "second-uid"
+			if tt.namespace != "" {
+				second.Namespace = tt.namespace
+			}
+			second.Spec.Source.GitHub.WebhookSecretRef.Name = "second-github"
+			firstSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "first-github", Namespace: first.Namespace}, Data: map[string][]byte{"webhook-secret": []byte("secret")}}
+			secondSecret := firstSecret.DeepCopy()
+			secondSecret.Name, secondSecret.Namespace = "second-github", second.Namespace
+			if tt.mutate != nil {
+				tt.mutate(second, secondSecret)
+			}
+			objects := []client.Object{first, second, firstSecret}
+			if !tt.missingSecret {
+				objects = append(objects, secondSecret)
+			}
+			failCreate := tt.failCreate
+			clusterClient := fake.NewClientBuilder().WithScheme(deliveryTestScheme(t)).WithObjects(objects...).WithInterceptorFuncs(interceptor.Funcs{
+				Create: func(ctx context.Context, c client.WithWatch, object client.Object, opts ...client.CreateOption) error {
+					if failCreate && object.GetName() == webhookDeliveryName(string(first.UID), body) {
+						return errors.New("delivery storage unavailable")
+					}
+					return c.Create(ctx, object, opts...)
+				},
+			}).Build()
+			handler := &GitHubHandler{Client: clusterClient, APIReader: clusterClient, Logger: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))}
+			signingSecret := []byte("secret")
+			if tt.invalidSignature {
+				signingSecret = []byte("invalid")
+			}
+			digest := hmac.New(sha256.New, signingSecret)
+			digest.Write(body)
+			wantStatus, wantProjects := tt.wantStatus, tt.wantProjects
+			for _, deliveryID := range []string{"original", "replay"} {
+				if deliveryID == "replay" && (tt.missingSecret || tt.failCreate) {
+					if tt.missingSecret {
+						if err := clusterClient.Create(context.Background(), secondSecret); err != nil {
+							t.Fatal(err)
+						}
+					}
+					failCreate = false
+					wantStatus, wantProjects = http.StatusAccepted, 2
+				}
+				request := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+				request.Header.Set("X-GitHub-Event", "push")
+				request.Header.Set("X-GitHub-Delivery", deliveryID)
+				request.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(digest.Sum(nil)))
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, request)
+				if response.Code != wantStatus {
+					t.Fatalf("%s status = %d, want %d: %s", deliveryID, response.Code, wantStatus, response.Body.String())
+				}
+				deliveries := &corev1.ConfigMapList{}
+				if err := clusterClient.List(context.Background(), deliveries, client.MatchingLabels{deliveryLabel: "true"}); err != nil {
+					t.Fatal(err)
+				}
+				if len(deliveries.Items) != wantProjects {
+					t.Fatalf("%s queued %d deliveries, want %d", deliveryID, len(deliveries.Items), wantProjects)
+				}
+				for _, object := range deliveries.Items {
+					queued := queuedDelivery{}
+					if err := json.Unmarshal([]byte(object.Data[deliveryDataKey]), &queued); err != nil {
+						t.Fatal(err)
+					}
+					project := first
+					if queued.ProjectName == second.Name {
+						project = second
+					}
+					if queued.ProjectName != project.Name || queued.ProjectUID != string(project.UID) || object.Namespace != project.Namespace || !metav1.IsControlledBy(&object, project) || queued.ReplayID != webhookReplayID(body) {
+						t.Fatalf("queued delivery = %#v, metadata = %#v", queued, object.ObjectMeta)
+					}
+					snapshot := &corev1.Secret{}
+					if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: object.Namespace, Name: queued.EventSnapshot}, snapshot); err != nil {
+						t.Fatal(err)
+					}
+					owner := metav1.GetControllerOf(snapshot)
+					if owner == nil || owner.Name != object.Name || !metav1.IsControlledBy(snapshot, &object) || snapshot.Immutable == nil || !*snapshot.Immutable || !bytes.Equal(snapshot.Data[eventsnapshot.DataKey], body) {
+						t.Fatalf("event snapshot = %#v", snapshot)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -359,13 +443,12 @@ func TestGitHubHandlerPreservesSupportedEventFixtures(t *testing.T) {
 			if response.Code != http.StatusAccepted {
 				t.Fatalf("response status = %d, body = %s", response.Code, response.Body.String())
 			}
-			replayID := webhookReplayID(body)
 			delivery := &corev1.ConfigMap{}
-			if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(body)}, delivery); err != nil {
+			if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: project.Namespace, Name: webhookDeliveryName(string(project.UID), body)}, delivery); err != nil {
 				t.Fatal(err)
 			}
 			snapshot := &corev1.Secret{}
-			if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: project.Namespace, Name: eventSnapshotName(replayID)}, snapshot); err != nil {
+			if err := clusterClient.Get(context.Background(), client.ObjectKey{Namespace: project.Namespace, Name: eventSnapshotName(delivery.Name)}, snapshot); err != nil {
 				t.Fatal(err)
 			}
 			if snapshot.Immutable == nil || !*snapshot.Immutable || !metav1.IsControlledBy(snapshot, delivery) || !bytes.Equal(snapshot.Data[eventsnapshot.DataKey], body) {

@@ -270,9 +270,16 @@ All references resolve within the resource's namespace. A `Project` selects its
 integration through the discriminated `spec.source` union. The supported
 variant is `type: GitHub`, with GitHub App configuration under `source.github`.
 The project defaults `spec.workflowDirectory` to `.open-actions/workflows`. Its
-source type and GitHub App and installation IDs are immutable. Only one project
-in the cluster may claim an installation; the earliest-created project retains
-the claim, and later duplicates remain unconfigured until the owner is deleted.
+source type and GitHub App and installation IDs are immutable. Multiple Projects
+may use the same GitHub App installation, in the same namespace or across
+namespaces. Each Project validates its own credentials and receives webhook
+events whose signatures match its webhook secret. Projects in the same namespace
+can reference the same credential Secret; Projects in different namespaces need
+credentials in each namespace. Each Project uses its own workflow directory,
+secrets, variables, fork pull request policy, and runners. If Projects use the
+same workflow directory, matching workflows run separately in every Project.
+See the [shared installation sample](../config/samples/actions_v1alpha1_projects-shared-installation.yaml).
+
 A `WorkflowRun` records provider-specific event data under its own immutable
 `spec.source` union. Each WorkflowJob records its GitHub commit status under
 `status.source.github.commitStatus`. For push, ordinary pull request, and
@@ -287,12 +294,12 @@ expanded JobID. For example, the `build` combination with `node: 18` and
 When matrix values are too long to include in the display name, their sorted
 description is replaced by a deterministic digest. Each job status targets its
 job's Console output when the Console URL is configured. Workflow and job names
-must produce unique contexts, ignoring case, among workflow files that can
-report the same commit because the commit-status API does not provide GitHub
+must produce unique contexts, ignoring case, across Projects and workflow files
+that can report the same commit because the commit-status API does not provide GitHub
 Actions' separate check suites. Otherwise their statuses share a context and
 can overwrite each other. The controller records a
 `GitHubStatusContextCollision` Warning event on the WorkflowRun when it detects
-this configuration.
+this configuration within a Project.
 
 Commit-status contexts longer than 100 Unicode characters are shortened with a
 deterministic digest suffix. Job contexts whose workflow path or logical job ID
@@ -950,7 +957,7 @@ The resources expose these condition contracts:
 | Resource | Condition | Status | Reasons |
 | --- | --- | --- | --- |
 | `Project` | `Configured` | `True` | `ConfigurationValid` |
-| `Project` | `Configured` | `False` | `DuplicateInstallation`, `CredentialsUnavailable`, `InvalidCredentials`, `ProjectValuesUnavailable` |
+| `Project` | `Configured` | `False` | `CredentialsUnavailable`, `InvalidCredentials`, `ProjectValuesUnavailable` |
 | `Runner` | `Ready` | `True` | `Ready` |
 | `Runner` | `Ready` | `False` | `ConfigurationInvalid`, `PodLevelResourcesInvalid`, `PodLevelResourcesUnsupported`, `ProjectUnavailable`, `ProjectNotConfigured` |
 | `Runner` | `Busy` | `False` | `Idle` |
@@ -980,8 +987,8 @@ The resources expose these condition contracts:
 | `WorkflowJob` | `CancellationRequested` | `False` | `ConditionPassed` |
 
 `Project/Configured` covers local Secret and ConfigMap availability,
-private-key parsing, Project value constraints, and installation uniqueness. It
-does not assert remote GitHub App or installation availability. `Runner/Ready`
+private-key parsing, and Project value constraints. It does not assert remote
+GitHub App or installation availability. `Runner/Ready`
 reports operational health independently of capacity; clients use
 `Runner/Busy` to determine whether a Runner already has an assignment.
 
@@ -1802,7 +1809,17 @@ retention policies still apply.
 ## Webhook API
 
 The webhook endpoint accepts only signed GitHub `POST` deliveries up to 900,000
-bytes and requires exactly one configured project for the installation.
+bytes and routes them to all configured Projects for the installation whose
+webhook secrets validate the signature. Signature validation follows
+[GitHub's webhook delivery requirements](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries).
+Unconfigured Projects and Projects whose configuration has not been reconciled
+for their current generation are skipped. An installation without configured
+Projects returns HTTP 503; a signature that matches none of their available
+webhook secrets returns HTTP 401. If a configured Project's secret is unavailable
+or its delivery cannot be queued, other matching Projects are still queued and
+the request returns an error. Retrying the delivery safely fills in any missing
+Project deliveries.
+
 Supported deliveries return HTTP 202 with `{"accepted":true,"queued":true}`. Unsupported
 event names return HTTP 202 with `{"accepted":true,"queued":false}`. For an
 ordinary open pull request, the controller resolves the merge base and
@@ -1819,5 +1836,5 @@ independently discovered `pull_request_target` runs.
 
 Queued deliveries are processed asynchronously. Invalid or unsupported workflow
 definitions fail the whole delivery before any `WorkflowRun` resources are
-created. Repeated deliveries with the same signed body are deduplicated for 24
-hours.
+created for that Project. Repeated deliveries with the same signed body are
+deduplicated independently for each Project identity for 24 hours.

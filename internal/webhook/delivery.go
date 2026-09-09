@@ -133,15 +133,28 @@ func (h *GitHubHandler) enqueueDelivery(ctx context.Context, project *actionsv1a
 		Repository: deliveryRepository{
 			ID: event.Repository.ID, Owner: event.Repository.Owner.Login, Name: event.Repository.Name,
 		},
-		Event:         normalized,
-		EventSnapshot: eventSnapshotName(replayID),
-		ReplayID:      replayID,
-		DeliveryID:    deliveryID,
+		Event:      normalized,
+		ReplayID:   replayID,
+		DeliveryID: deliveryID,
 	}
 	return h.enqueueQueuedDelivery(ctx, project, delivery, signedBody, signedBody)
 }
 
 func (h *GitHubHandler) enqueueQueuedDelivery(ctx context.Context, project *actionsv1alpha1.Project, delivery queuedDelivery, identity, eventSnapshot []byte) error {
+	name := webhookDeliveryName(string(project.UID), identity)
+	// Reuse a stored delivery named from the body to preserve its event snapshot on retries.
+	storedDelivery := &corev1.ConfigMap{}
+	bodyKey := client.ObjectKey{Namespace: project.Namespace, Name: "delivery-" + webhookReplayID(identity)}
+	if err := h.APIReader.Get(ctx, bodyKey, storedDelivery); err == nil {
+		if metav1.IsControlledBy(storedDelivery, project) {
+			name = storedDelivery.Name
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+	if eventSnapshot != nil {
+		delivery.EventSnapshot = eventSnapshotName(name)
+	}
 	data, err := json.Marshal(delivery)
 	if err != nil {
 		return err
@@ -150,7 +163,7 @@ func (h *GitHubHandler) enqueueQueuedDelivery(ctx context.Context, project *acti
 		return fmt.Errorf("normalized webhook delivery exceeds %d bytes", maxDeliveryBytes)
 	}
 	object := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
-		Name:      webhookDeliveryName(identity),
+		Name:      name,
 		Namespace: project.Namespace,
 		Labels:    map[string]string{deliveryLabel: "true"},
 	}, Data: map[string]string{deliveryDataKey: string(data)}}
@@ -208,12 +221,13 @@ func (h *GitHubHandler) ensureEventSnapshot(ctx context.Context, delivery *corev
 	return nil
 }
 
-func eventSnapshotName(replayID string) string {
-	return "event-" + replayID
+func eventSnapshotName(deliveryName string) string {
+	return "event-" + strings.TrimPrefix(deliveryName, "delivery-")
 }
 
-func webhookDeliveryName(body []byte) string {
-	return "delivery-" + webhookReplayID(body)
+func webhookDeliveryName(projectUID string, body []byte) string {
+	identity := append([]byte(projectUID+"\x00"), body...)
+	return "delivery-" + webhookReplayID(identity)
 }
 
 func webhookReplayID(body []byte) string {
@@ -316,7 +330,7 @@ func (r *DeliveryReconciler) Reconcile(ctx context.Context, request ctrl.Request
 	if err := json.Unmarshal([]byte(object.Data[deliveryDataKey]), &delivery); err != nil {
 		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, fmt.Sprintf("decode delivery: %v", err))
 	}
-	if delivery.EventSnapshot != "" && delivery.EventSnapshot != eventSnapshotName(delivery.ReplayID) {
+	if delivery.EventSnapshot != "" && delivery.EventSnapshot != eventSnapshotName(object.Name) {
 		return ctrl.Result{}, r.finish(ctx, object, deliveryStateFailed, 0, "delivery contains an invalid event snapshot reference")
 	}
 	if revision := object.Data[deliveryRevisionKey]; revision != "" {

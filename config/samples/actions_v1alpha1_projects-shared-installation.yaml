@@ -1,0 +1,37 @@
+apiVersion: actions.kelos.dev/v1alpha1
+kind: Project
+metadata:
+  name: build
+  namespace: open-actions
+spec:
+  source:
+    type: GitHub
+    github:
+      appID: 12345
+      installationID: 67890
+      privateKeySecretRef:
+        name: open-actions-github-app
+        key: private-key.pem
+      webhookSecretRef:
+        name: open-actions-github-app
+        key: webhook-secret
+  workflowDirectory: .open-actions/build
+---
+apiVersion: actions.kelos.dev/v1alpha1
+kind: Project
+metadata:
+  name: deploy
+  namespace: open-actions
+spec:
+  source:
+    type: GitHub
+    github:
+      appID: 12345
+      installationID: 67890
+      privateKeySecretRef:
+        name: open-actions-github-app
+        key: private-key.pem
+      webhookSecretRef:
+        name: open-actions-github-app
+        key: webhook-secret
+  workflowDirectory: .open-actions/deploy
