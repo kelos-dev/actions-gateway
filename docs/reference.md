@@ -45,6 +45,13 @@ suite and per-job check-run model, and does not populate a pull request's Checks
 tab. This compatibility gap is tracked in
 [issue #162](https://github.com/kelos-dev/open-actions/issues/162).
 
+GitHub job statuses are reported asynchronously. Slow status requests and
+reporting retries do not delay dependency readiness or workflow cancellation.
+WorkflowRun deletion still waits for the final GitHub report to succeed or for
+reporting to be judged permanently unavailable. GitHub statuses can lag behind
+the workflow's Kubernetes status. Workflow discovery and runner credential
+creation still require GitHub API access and remain subject to its rate limits.
+
 `--max-job-timeout` is the cluster-wide upper bound for workflow job execution
 and defaults to `6h`. It must be a positive whole number of minutes. The Helm
 chart configures it through `controller.maxJobTimeout`.
