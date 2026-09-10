@@ -5,10 +5,13 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -27,6 +30,20 @@ func TestGitHubRepositoryResolverUsesProjectInstallation(t *testing.T) {
 		requests++
 		switch {
 		case request.Method == http.MethodPost && request.URL.Path == "/app/installations/2/access_tokens":
+			var scope struct {
+				Repositories []string          `json:"repositories"`
+				Permissions  map[string]string `json:"permissions"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&scope); err != nil {
+				t.Error(err)
+			}
+			wantRepository, wantPermission := "example", "metadata"
+			if requests == 3 {
+				wantRepository, wantPermission = "Example", "contents"
+			}
+			if !reflect.DeepEqual(scope.Repositories, []string{wantRepository}) || !reflect.DeepEqual(scope.Permissions, map[string]string{wantPermission: "read"}) {
+				t.Errorf("installation token scope = %#v", scope)
+			}
 			fmt.Fprint(writer, `{"token":"installation-token","expires_at":"2099-01-01T00:00:00Z"}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/acme/example":
 			if request.Header.Get("Authorization") != "Bearer installation-token" {
@@ -34,6 +51,11 @@ func TestGitHubRepositoryResolverUsesProjectInstallation(t *testing.T) {
 				return
 			}
 			fmt.Fprint(writer, `{"id":123,"name":"Example","owner":{"login":"Acme"}}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/Acme/Example/contents/.open-actions/workflows/deploy.yaml":
+			if request.Header.Get("Authorization") != "Bearer installation-token" || request.URL.Query().Get("ref") != strings.Repeat("b", 40) {
+				t.Errorf("workflow request = %#v", request)
+			}
+			fmt.Fprintf(writer, `{"content":%q,"encoding":"base64"}`, base64.StdEncoding.EncodeToString([]byte(testDispatchWorkflow)))
 		default:
 			http.NotFound(writer, request)
 		}
@@ -62,6 +84,10 @@ func TestGitHubRepositoryResolverUsesProjectInstallation(t *testing.T) {
 	}
 	if repository.ID != 123 || repository.Owner != "Acme" || repository.Name != "Example" || requests != 2 {
 		t.Fatalf("Resolve() = %#v after %d requests", repository, requests)
+	}
+	workflowFile, err := resolver.GetWorkflowFile(context.Background(), project, repository.Owner, repository.Name, ".open-actions/workflows/deploy.yaml", strings.Repeat("b", 40))
+	if err != nil || string(workflowFile) != testDispatchWorkflow || requests != 4 {
+		t.Fatalf("GetWorkflowFile() = %q, %v after %d requests", workflowFile, err, requests)
 	}
 }
 

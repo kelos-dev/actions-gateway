@@ -133,12 +133,25 @@ tracked in [issue #160](https://github.com/kelos-dev/open-actions/issues/160).
 An administrator can use **Run workflow** to create a `workflow_dispatch`
 WorkflowRun in any configured Project namespace. The form accepts a repository,
 workflow path, branch or tag, pinned commit SHA, and declared workflow inputs.
+Choose **Load workflow** to read the workflow at that commit and display its
+declared inputs, descriptions, defaults, and choices, including for workflows
+with no previous runs. Changing the Project, repository, branch or tag, commit,
+or workflow path requires loading the workflow again before running it.
+Reloading the same selection preserves supplied input values and which optional
+inputs are included.
 The Console authenticates through the selected Project's GitHub App installation
-and records the repository ID and canonical owner and name returned by GitHub.
+using repository metadata and contents read permissions, and records the
+repository ID and canonical owner and name returned by GitHub. It verifies that
+the selected workflow declares `workflow_dispatch` and validates the supplied
+inputs before creating a WorkflowRun. Omitted defaults are applied by the
+controller.
 Starting from an existing branch- or tag-backed run prepopulates its Project,
 repository, workflow, revision, and the typed inputs declared by the run's
-immutable workflow file snapshot. Each form instance carries a request ID, so
-resubmitting the same dispatch is idempotent and redirects to the existing run.
+immutable workflow file snapshot. If that snapshot is unavailable, choose
+**Load workflow** to fetch the declarations and defaults from GitHub; the source
+run's input values must be entered again. Each form instance carries a request
+ID, so resubmitting the same dispatch is idempotent and redirects to the existing
+run.
 
 The Projects page lists Project configuration across all namespaces. A Project
 detail page lists the names, but never the values, of keys in its referenced

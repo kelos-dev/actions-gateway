@@ -40,8 +40,21 @@ type testLogSource struct {
 }
 
 type testRepositoryResolver struct {
-	repository actionsv1alpha1.GitHubRepository
-	err        error
+	repository       actionsv1alpha1.GitHubRepository
+	err              error
+	workflowFile     string
+	workflowErr      error
+	workflowRequests []testWorkflowFileRequest
+}
+
+type testWorkflowFileRequest struct {
+	project                     client.ObjectKey
+	owner, name, path, revision string
+}
+
+func (r *testRepositoryResolver) GetWorkflowFile(_ context.Context, project *actionsv1alpha1.Project, owner, name, path, revision string) ([]byte, error) {
+	r.workflowRequests = append(r.workflowRequests, testWorkflowFileRequest{client.ObjectKeyFromObject(project), owner, name, path, revision})
+	return []byte(r.workflowFile), r.workflowErr
 }
 
 type createWorkflowRunThenErrorClient struct {
@@ -1086,7 +1099,7 @@ func TestConsoleShowsRerunWhenOriginalWorkflowRunIsGone(t *testing.T) {
 
 func TestConsoleCreatesWorkflowDispatch(t *testing.T) {
 	handler := newTestHandler(t, false)
-	handler.repositories = &testRepositoryResolver{repository: actionsv1alpha1.GitHubRepository{ID: 456, Owner: "canonical-acme", Name: "canonical-example"}}
+	handler.repositories = &testRepositoryResolver{repository: actionsv1alpha1.GitHubRepository{ID: 456, Owner: "canonical-acme", Name: "canonical-example"}, workflowFile: testDispatchWorkflow}
 	sourceRun := &actionsv1alpha1.WorkflowRun{}
 	if err := handler.client.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "ci"}, sourceRun); err != nil {
 		t.Fatal(err)
@@ -1175,6 +1188,7 @@ func TestConsoleCreatesWorkflowDispatch(t *testing.T) {
 		handler.ServeHTTP(response, request)
 		return response
 	}
+	loadDispatchForm(t, handler, form)
 	response := dispatch(form)
 	wantLocation := "/runs/default/dispatch-" + requestID
 	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != wantLocation {
@@ -1201,12 +1215,14 @@ func TestConsoleCreatesWorkflowDispatch(t *testing.T) {
 		t.Fatalf("workflow dispatch retry = %d, %q", retryResponse.Code, retryResponse.Header().Get("Location"))
 	}
 	form.Set("revision", strings.Repeat("c", 40))
+	loadDispatchForm(t, handler, form)
 	if conflict := dispatch(form); conflict.Code != http.StatusConflict {
 		t.Fatalf("conflicting workflow dispatch = %d, %q", conflict.Code, conflict.Body.String())
 	}
 	form.Set("request-id", "abcdef0123456789abcd")
 	form.Set("ref-type", "tag")
 	form.Set("ref-name", "v1.2.3")
+	loadDispatchForm(t, handler, form)
 	if tagResponse := dispatch(form); tagResponse.Code != http.StatusSeeOther {
 		t.Fatalf("tag workflow dispatch = %d, %q", tagResponse.Code, tagResponse.Body.String())
 	}
@@ -1284,6 +1300,7 @@ func TestConsoleDoesNotCreateWorkflowDispatchWhenRepositoryResolutionFails(t *te
 	form := url.Values{
 		"csrf":             {handler.csrfToken},
 		"request-id":       {"0123456789abcdefabcd"},
+		"action":           {"load"},
 		"project":          {"default/project"},
 		"repository-owner": {"acme"},
 		"repository-name":  {"missing"},

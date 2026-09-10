@@ -11,9 +11,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// RepositoryResolver resolves repository identity through a Project's source.
+// RepositoryResolver reads repository identity and workflow files through a Project's source.
 type RepositoryResolver interface {
 	Resolve(context.Context, *actionsv1alpha1.Project, string, string) (actionsv1alpha1.GitHubRepository, error)
+	GetWorkflowFile(context.Context, *actionsv1alpha1.Project, string, string, string, string) ([]byte, error)
 }
 
 // GitHubRepositoryResolver resolves repositories through GitHub App installations.
@@ -33,22 +34,9 @@ func NewGitHubRepositoryResolver(reader client.Reader, github *githubclient.Clie
 // Resolve returns GitHub's canonical identity for a repository accessible to the Project.
 func (r *GitHubRepositoryResolver) Resolve(ctx context.Context, project *actionsv1alpha1.Project, owner, name string) (actionsv1alpha1.GitHubRepository, error) {
 	requestedRepository := owner + "/" + name
-	githubConfig := project.Spec.Source.GitHub
-	if githubConfig == nil {
-		return actionsv1alpha1.GitHubRepository{}, fmt.Errorf("Project %q has no GitHub source", project.Name)
-	}
-	secret := &corev1.Secret{}
-	selector := githubConfig.PrivateKeySecretRef
-	if err := r.reader.Get(ctx, client.ObjectKey{Namespace: project.Namespace, Name: selector.Name}, secret); err != nil {
-		return actionsv1alpha1.GitHubRepository{}, fmt.Errorf("get Project %q private key Secret %q: %w", project.Name, selector.Name, err)
-	}
-	privateKey := secret.Data[selector.Key]
-	if len(privateKey) == 0 {
-		return actionsv1alpha1.GitHubRepository{}, fmt.Errorf("Project %q private key Secret %q does not contain non-empty key %q", project.Name, selector.Name, selector.Key)
-	}
-	installation, err := r.github.CachedInstallation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, name, githubclient.InstallationPermissions{})
+	installation, err := r.installation(ctx, project, name, githubclient.InstallationPermissions{})
 	if err != nil {
-		return actionsv1alpha1.GitHubRepository{}, fmt.Errorf("authenticate Project %q GitHub installation: %w", project.Name, err)
+		return actionsv1alpha1.GitHubRepository{}, err
 	}
 	repository, err := installation.GetRepository(ctx, owner, name)
 	if err != nil {
@@ -61,4 +49,34 @@ func (r *GitHubRepositoryResolver) Resolve(ctx context.Context, project *actions
 		return actionsv1alpha1.GitHubRepository{}, fmt.Errorf("GitHub returned invalid identity for repository %s", requestedRepository)
 	}
 	return actionsv1alpha1.GitHubRepository{ID: repository.ID, Owner: owner, Name: name}, nil
+}
+
+// GetWorkflowFile reads a workflow at the selected commit using contents read permission.
+func (r *GitHubRepositoryResolver) GetWorkflowFile(ctx context.Context, project *actionsv1alpha1.Project, owner, name, path, revision string) ([]byte, error) {
+	installation, err := r.installation(ctx, project, name, githubclient.InstallationPermissions{"contents": "read"})
+	if err != nil {
+		return nil, err
+	}
+	return installation.GetFile(ctx, owner, name, path, revision)
+}
+
+func (r *GitHubRepositoryResolver) installation(ctx context.Context, project *actionsv1alpha1.Project, name string, permissions githubclient.InstallationPermissions) (*githubclient.InstallationClient, error) {
+	githubConfig := project.Spec.Source.GitHub
+	if githubConfig == nil {
+		return nil, fmt.Errorf("Project %q has no GitHub source", project.Name)
+	}
+	secret := &corev1.Secret{}
+	selector := githubConfig.PrivateKeySecretRef
+	if err := r.reader.Get(ctx, client.ObjectKey{Namespace: project.Namespace, Name: selector.Name}, secret); err != nil {
+		return nil, fmt.Errorf("get Project %q private key Secret %q: %w", project.Name, selector.Name, err)
+	}
+	privateKey := secret.Data[selector.Key]
+	if len(privateKey) == 0 {
+		return nil, fmt.Errorf("Project %q private key Secret %q does not contain non-empty key %q", project.Name, selector.Name, selector.Key)
+	}
+	installation, err := r.github.CachedInstallation(ctx, githubConfig.AppID, githubConfig.InstallationID, privateKey, name, permissions)
+	if err != nil {
+		return nil, fmt.Errorf("authenticate Project %q GitHub installation: %w", project.Name, err)
+	}
+	return installation, nil
 }

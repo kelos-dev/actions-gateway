@@ -172,6 +172,13 @@ type dispatchPageData struct {
 	RequestID          string
 }
 
+func (d dispatchPageData) SelectionKey() string {
+	selection := []string{d.SelectedProject, d.RepositoryOwner, d.RepositoryName, d.RefType, d.RefName, d.Revision, d.WorkflowPath}
+	encoded, _ := json.Marshal(selection)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
 type dispatchProjectOption struct {
 	Value    string
 	Label    string
@@ -346,7 +353,7 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		case http.MethodGet:
 			h.workflowDispatchPage(writer, request)
 		case http.MethodPost:
-			h.createWorkflowDispatch(writer, request)
+			h.submitWorkflowDispatch(writer, request)
 		default:
 			writer.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
 			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
@@ -731,16 +738,6 @@ func (h *Handler) loadDispatchPageData(ctx context.Context, query url.Values) (d
 				data.Inputs = declaredDispatchInputs(trigger.Inputs, githubSource.Event.Inputs)
 			}
 		}
-		if !data.InputsFromWorkflow {
-			inputNames := make([]string, 0, len(githubSource.Event.Inputs))
-			for name := range githubSource.Event.Inputs {
-				inputNames = append(inputNames, name)
-			}
-			sort.Strings(inputNames)
-			for _, name := range inputNames {
-				data.Inputs = append(data.Inputs, dispatchInputPageData{Name: name, Value: githubSource.Event.Inputs[name]})
-			}
-		}
 	}
 	for index := range projects.Items {
 		project := &projects.Items[index]
@@ -801,7 +798,7 @@ func declaredDispatchInputs(definitions map[string]workflow.WorkflowInput, suppl
 	return inputs
 }
 
-func (h *Handler) createWorkflowDispatch(writer http.ResponseWriter, request *http.Request) {
+func (h *Handler) submitWorkflowDispatch(writer http.ResponseWriter, request *http.Request) {
 	request.Body = http.MaxBytesReader(writer, request.Body, dispatchRequestSize)
 	if err := request.ParseForm(); err != nil {
 		http.Error(writer, "invalid workflow dispatch", http.StatusBadRequest)
@@ -809,6 +806,11 @@ func (h *Handler) createWorkflowDispatch(writer http.ResponseWriter, request *ht
 	}
 	if !h.validCSRF(request.PostForm.Get("csrf")) {
 		http.Error(writer, "invalid CSRF token", http.StatusForbidden)
+		return
+	}
+	action := request.PostForm.Get("action")
+	if action != "" && action != "load" {
+		http.Error(writer, "invalid workflow dispatch action", http.StatusBadRequest)
 		return
 	}
 	requestID := request.PostForm.Get("request-id")
@@ -869,9 +871,14 @@ func (h *Handler) createWorkflowDispatch(writer http.ResponseWriter, request *ht
 		http.Error(writer, "invalid workflow path", http.StatusBadRequest)
 		return
 	}
-	inputs, err := dispatchInputs(request.PostForm["input-name"], request.PostForm["input-value"])
-	if err != nil {
-		http.Error(writer, err.Error(), http.StatusBadRequest)
+	data := dispatchPageData{
+		SelectedProject: namespacedValue(namespace, projectName), RepositoryOwner: repositoryOwner, RepositoryName: repositoryName,
+		RefType: refType, RefName: strings.TrimSpace(request.PostForm.Get("ref-name")), Revision: revision, WorkflowPath: workflowPath,
+		CSRFToken: h.csrfToken, RequestID: requestID,
+	}
+	sameSelection := request.PostForm.Get("loaded-selection") == data.SelectionKey()
+	if action != "load" && !sameSelection {
+		http.Error(writer, "load the selected workflow before running it", http.StatusConflict)
 		return
 	}
 	repository, err := h.repositories.Resolve(request.Context(), project, repositoryOwner, repositoryName)
@@ -883,6 +890,57 @@ func (h *Handler) createWorkflowDispatch(writer http.ResponseWriter, request *ht
 			return
 		}
 		h.writeResolutionError(writer, request, fmt.Errorf("resolve workflow dispatch repository %s/%s: %w", repositoryOwner, repositoryName, err))
+		return
+	}
+	workflowFile, err := h.repositories.GetWorkflowFile(request.Context(), project, repository.Owner, repository.Name, workflowPath, revision)
+	if err != nil {
+		var apiError *githubclient.APIError
+		if errors.As(err, &apiError) && (apiError.StatusCode == http.StatusNotFound || apiError.StatusCode == http.StatusUnprocessableEntity) {
+			http.Error(writer, fmt.Sprintf("workflow %q at revision %q in repository %s/%s is not accessible to Project %q", workflowPath, revision, repository.Owner, repository.Name, project.Name), http.StatusBadRequest)
+			return
+		}
+		h.writeResolutionError(writer, request, fmt.Errorf("load workflow %q for Project %q: %w", workflowPath, project.Name, err))
+		return
+	}
+	definition, err := workflow.Parse(workflowFile)
+	if err != nil {
+		http.Error(writer, fmt.Sprintf("parse workflow %q: %v", workflowPath, err), http.StatusBadRequest)
+		return
+	}
+	trigger, found := definition.On.Events[string(actionsv1alpha1.GitHubEventNameWorkflowDispatch)]
+	if !found {
+		http.Error(writer, fmt.Sprintf("workflow %q does not declare workflow_dispatch", workflowPath), http.StatusBadRequest)
+		return
+	}
+	var inputs map[string]string
+	if action != "load" || sameSelection {
+		inputs, err = dispatchInputs(request.PostForm["input-name"], request.PostForm["input-value"])
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	if action == "load" {
+		page, err := h.loadDispatchPageData(request.Context(), url.Values{"project": {data.SelectedProject}})
+		if err != nil {
+			h.writeResolutionError(writer, request, err)
+			return
+		}
+		data.Projects = page.Projects
+		data.InputsFromWorkflow = true
+		data.Inputs = declaredDispatchInputs(trigger.Inputs, inputs)
+		if sameSelection {
+			for index := range data.Inputs {
+				input := &data.Inputs[index]
+				_, included := inputs[input.Name]
+				input.Included = input.Required || included
+			}
+		}
+		h.writeHTML(writer, h.dispatchPage, data)
+		return
+	}
+	if _, _, err := workflow.Match(definition.On, workflow.Event{Name: string(actionsv1alpha1.GitHubEventNameWorkflowDispatch), Inputs: inputs}); err != nil {
+		http.Error(writer, fmt.Sprintf("invalid inputs for workflow %q: %v", workflowPath, err), http.StatusBadRequest)
 		return
 	}
 	desired := &actionsv1alpha1.WorkflowRun{
