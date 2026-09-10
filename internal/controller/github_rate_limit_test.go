@@ -39,7 +39,7 @@ func TestRequeueAfterGitHubRateLimit(t *testing.T) {
 
 func TestGitHubStatusRateLimitIsRetryable(t *testing.T) {
 	now := time.Date(2026, time.August, 23, 12, 0, 0, 0, time.UTC)
-	reconciler := &WorkflowRunReconciler{Now: func() time.Time { return now }}
+	reconciler := &GitHubStatusReconciler{Now: func() time.Time { return now }}
 	err := &githubclient.APIError{
 		StatusCode: http.StatusForbidden,
 		Status:     "403 Forbidden",

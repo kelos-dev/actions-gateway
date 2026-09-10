@@ -218,6 +218,15 @@ func runManager(arguments []string) error {
 	}).SetupWithManager(controllerManager); err != nil {
 		return fmt.Errorf("configure WorkflowRun controller: %w", err)
 	}
+	if err := (&controller.GitHubStatusReconciler{
+		Client:     controllerManager.GetClient(),
+		APIReader:  controllerManager.GetAPIReader(),
+		GitHub:     github,
+		ConsoleURL: normalizedConsoleURL,
+		Recorder:   controllerManager.GetEventRecorder("github-status-controller"),
+	}).SetupWithManager(controllerManager); err != nil {
+		return fmt.Errorf("configure GitHub status controller: %w", err)
+	}
 	if err := (&controller.RunnerReconciler{
 		Client:                   controllerManager.GetClient(),
 		APIReader:                controllerManager.GetAPIReader(),
